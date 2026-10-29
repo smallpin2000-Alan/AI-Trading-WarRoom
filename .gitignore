@@ -1,0 +1,19 @@
+# Python cache & test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Logs & runtime configs
+SolPY.log
+*.log
+Configs/
+
+# Credentials (never commit)
+config/taishin_config.json
+.env
+
+# Google Drive shortcut pointers
+*.gdoc
+*.gsheet
+*.gslides

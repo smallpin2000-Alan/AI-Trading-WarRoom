@@ -1,0 +1,45 @@
+{
+  "id": "ma_cross_v1",
+  "version": 4,
+  "symbol": "TMF",
+  "timeframe": "60m",
+  "session": "day_and_night",
+  "indicators": {
+    "ma5":  {"type": "SMA", "source": "close", "length": 5, "timeframe": "60m"},
+    "ma10": {"type": "SMA", "source": "close", "length": 10, "timeframe": "60m"},
+    "ma20": {"type": "SMA", "source": "close", "length": 20, "timeframe": "60m"},
+    "daily_ma20": {"type": "SMA", "source": "close", "length": 20, "timeframe": "1D"}
+  },
+  "entry_long": {
+    "all": [
+      {"cross_above": ["ma5", "ma10"]},
+      {"gt": ["ma10", "ma20"]},
+      {"gt": ["close", "daily_ma20"]},
+      {"lte": [{"bars_since": {"cross_above": ["ma5", "ma10"]}}, 3]}
+    ]
+  },
+  "entry_short": {
+    "all": [
+      {"cross_below": ["ma5", "ma10"]},
+      {"lt": ["ma10", "ma20"]},
+      {"lt": ["close", "daily_ma20"]}
+    ]
+  },
+  "exit": {
+    "stop_loss": {
+      "type": "indicator_cross",
+      "long": {"cross_below": ["close", "ma20"]},
+      "short": {"cross_above": ["close", "ma20"]}
+    },
+    "take_profit": null,
+    "trailing_stop": {"type": "points", "value": 80},
+    "time_exit": {"before_settlement": true, "minutes_before_close": 15}
+  },
+  "execution": {
+    "signal_on": "bar_close",
+    "fill_at": "next_bar_open",
+    "order_type": "range_market",
+    "slippage_points": 1
+  },
+  "position_sizing": {"type": "fixed", "contracts": 1}
+}

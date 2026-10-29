@@ -1,0 +1,38 @@
+{
+  "TMF": {
+    "symbol": "TMF",
+    "name": "微型臺指期貨",
+    "exchange": "TAIFEX",
+    "point_value": 10,
+    "tick_size": 1.0,
+    "tax_rate": 0.00002,
+    "default_commission": 12.0,
+    "initial_margin": 16100,
+    "maintenance_margin": 12400,
+    "settlement_rule": "third_wednesday"
+  },
+  "MXF": {
+    "symbol": "MXF",
+    "name": "小型臺指期貨",
+    "exchange": "TAIFEX",
+    "point_value": 50,
+    "tick_size": 1.0,
+    "tax_rate": 0.00002,
+    "default_commission": 25.0,
+    "initial_margin": 80500,
+    "maintenance_margin": 62000,
+    "settlement_rule": "third_wednesday"
+  },
+  "TXF": {
+    "symbol": "TXF",
+    "name": "臺股期貨(大台)",
+    "exchange": "TAIFEX",
+    "point_value": 200,
+    "tick_size": 1.0,
+    "tax_rate": 0.00002,
+    "default_commission": 50.0,
+    "initial_margin": 322000,
+    "maintenance_margin": 248000,
+    "settlement_rule": "third_wednesday"
+  }
+}
