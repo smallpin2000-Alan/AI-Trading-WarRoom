@@ -777,8 +777,9 @@ def main():
                         st.warning(msg_rm)
             st.caption("💡 提示：清單儲存於 `config/watchlist.json`，您可以在此直接輸入任何台股代碼（如 `2317`、`2454`、`2603`、`0050`）或期貨代碼（如 `TMFR1`、`TXFR1`）隨時增減。")
 
-        btn_c1, btn_c2, btn_c3 = st.columns([1.2, 1, 1.2])
+        btn_c1, btn_c2, btn_c3, btn_c4 = st.columns([1.15, 0.9, 1.15, 0.9])
         with btn_c1:
+            st.write("")
             if st.button("🚀 連線行情伺服器", width="stretch", type="primary"):
                 with st.spinner("正在連線台新伺服器並載入真實 K 線與即時報價..."):
                     feed.start(actual_user, ts_pwd, clean_sym)
@@ -788,16 +789,49 @@ def main():
                             break
                     st.rerun()
         with btn_c2:
+            st.write("")
             if st.button("🛑 中斷連線", width="stretch"):
                 feed.stop()
                 st.rerun()
         with btn_c3:
-            auto_refresh = st.checkbox("自動即時刷新行情 (3秒)", value=False)
+            refresh_opt = st.selectbox(
+                "畫面自動刷新頻率 (僅讀本地記憶體，不耗 API 次數)",
+                ["10 秒 (推薦)", "5 秒", "15 秒", "30 秒", "60 秒", "關閉自動刷新"],
+                index=0,
+                key="live_refresh_interval_opt",
+            )
+            if refresh_opt == "關閉自動刷新" or not feed.connected:
+                quote_refresh_sec = None
+                chart_refresh_sec = None
+            else:
+                quote_refresh_sec = int(refresh_opt.split(" ")[0])
+                # K 線圖以 1 分鐘 K 為主，最低 30 秒才局部重繪一次，避免干擾看盤縮放
+                chart_refresh_sec = max(30, quote_refresh_sec)
+        with btn_c4:
+            st.write("")
             if st.button("🔄 立即刷新", width="stretch"):
                 st.rerun()
 
-        # 連線狀態與最新行情看板 (採用非阻塞 st.fragment，徹底移除 time.sleep(3) 造成的卡頓)
+        # 1. 頂部即時報價數字看板 (獨立輕量 Fragment，依選取秒數局部跳動，不干擾下方 K 線圖)
         st.markdown("---")
+
+        @st.fragment(run_every=quote_refresh_sec)
+        def _render_live_quote_banner():
+            m_c1, m_c2, m_c3, m_c4 = st.columns([1.8, 1.0, 0.8, 1.2])
+            m_c1.metric("伺服器狀態", feed.status_msg)
+            latest_tick = feed.get_latest_tick()
+            if latest_tick:
+                m_c2.metric("最新成交價", f"{latest_tick.price:,.1f}")
+                m_c3.metric("單量", f"{latest_tick.volume}")
+                m_c4.metric("最新成交時間", latest_tick.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+            else:
+                m_c2.metric("最新成交價", "等待台新 API 報價中...")
+                m_c3.metric("單量", "--")
+                m_c4.metric("最新成交時間", "--")
+
+        _render_live_quote_banner()
+
+        # 2. 台新 API 真實 K 棒圖表 (獨立 Fragment，最低 30 秒更新一次，看圖縮放零閃爍)
         k_hdr1, k_hdr2, k_hdr3 = st.columns([2.2, 0.9, 0.9])
         with k_hdr2:
             chart_tf = st.selectbox(
@@ -814,20 +848,8 @@ def main():
                 key="live_chart_vis_bars",
             )
 
-        @st.fragment(run_every=3 if (auto_refresh and feed.connected) else None)
-        def _render_live_quote_and_kchart():
-            m_c1, m_c2, m_c3, m_c4 = st.columns([1.8, 1.0, 0.8, 1.2])
-            m_c1.metric("伺服器狀態", feed.status_msg)
-            latest_tick = feed.get_latest_tick()
-            if latest_tick:
-                m_c2.metric("最新成交價", f"{latest_tick.price:,.1f}")
-                m_c3.metric("單量", f"{latest_tick.volume}")
-                m_c4.metric("最新成交時間", latest_tick.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
-            else:
-                m_c2.metric("最新成交價", "等待台新 API 報價中...")
-                m_c3.metric("單量", "--")
-                m_c4.metric("最新成交時間", "--")
-
+        @st.fragment(run_every=chart_refresh_sec)
+        def _render_live_kchart_and_ticks():
             real_bars = feed.get_bars(timeframe=chart_tf, session="day_and_night")
             if real_bars.height > 0:
                 st.markdown(f"**📊 台新 API `{feed.symbol}` {chart_tf} K 線圖 (共 {real_bars.height} 根完整載入)**")
@@ -880,7 +902,7 @@ def main():
                     key=f"plotly_live_k_{feed.symbol}_{chart_tf}_{vis_bars_opt}",
                     config={"scrollZoom": True, "displayModeBar": True},
                 )
-                st.caption("💡 操作提示：已載入本地全部歷史 K 棒（非僅 120 根）！您可直接用**滑鼠滾輪縮放**（縮小 K 棒會自動往左展開更多歷史 K 棒）、**按住滑鼠左鍵左右拖曳平移**，或由右上角「預設畫面 K 棒數量」直接切換（60 ~ 全部顯示）。開啟 3 秒自動刷新時，系統會**完整保留您的縮放比例與位置**，不會強制重置。")
+                st.caption("💡 操作提示：上方成交價依您選定的秒數（預設 10 秒）自動局部更新，下方 K 線圖則每 30 秒才更新一次（且完整保留您的縮放比例與位置），看盤操作完全不卡頓。")
             else:
                 st.info("💡 請點擊上方「🚀 連線行情伺服器」，系統將透過台新官方 API 載入真實 1 分鐘 K 棒與即時成交報價。")
 
@@ -896,7 +918,7 @@ def main():
                     })
                 st.dataframe(pd.DataFrame(tick_rows), width="stretch", height=180)
 
-        _render_live_quote_and_kchart()
+        _render_live_kchart_and_ticks()
 
     elif selected_nav == nav_tabs[4]:
         st.subheader("🎯 紙上交易模擬撮合與風控中心 (Paper Trading & Risk Center)")
