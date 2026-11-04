@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.5.1"
+APP_VERSION = "v2.5.2"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -400,11 +400,7 @@ def main():
             sync_badge = "🟡 尚未從伺服器拉取最新資料（目前顯示快取，請點擊上方「🚀 連線 / 重新 AI 分析」）"
 
         latest_1m_str = sync_info["bar_time_str"] if sync_info["bar_time_str"] != "--" else last_bar_time_str
-        bar_display_label = (
-            f"{latest_1m_str}"
-            if chart_tf == "1m"
-            else f"{latest_1m_str} ({chart_tf} 當前K棒起點 {last_bar_time_str[-5:]})"
-        )
+        bar_display_label = latest_1m_str
 
         st.markdown(f"""
         <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
@@ -677,6 +673,12 @@ def main():
                 borderpad=4,
             )
 
+            # 由最後一根最新 K 棒 (total_k - 1) 往回取固定間距刻度，確保最新 K 棒時間 100% 顯示在 X 軸上絕不跳格！
+            tick_step = max(1, vis_count // 18)
+            tick_indices = list(range(total_k - 1, -1, -tick_step))[::-1]
+            all_time_labels = df_plot["time_label"].tolist()
+            explicit_tickvals = [all_time_labels[idx] for idx in tick_indices] + [future_labels[1], future_labels[4]]
+
             fig_k.update_layout(
                 template="plotly_dark",
                 height=500,
@@ -684,6 +686,9 @@ def main():
                 xaxis_rangeslider_visible=False,
                 xaxis=dict(
                     type="category",
+                    tickmode="array",
+                    tickvals=explicit_tickvals,
+                    ticktext=explicit_tickvals,
                     range=[init_start - 0.5, total_k + len(future_labels) + 0.5],
                     minallowed=-0.5,
                     maxallowed=total_k + len(future_labels) + 1.5,
@@ -703,7 +708,7 @@ def main():
                     font=dict(size=12),
                 ),
                 dragmode="pan",
-                uirevision=f"unified_k_{clean_sym}_{chart_tf}_{vis_bars_opt}",
+                uirevision=f"unified_k_{clean_sym}_{chart_tf}_{vis_bars_opt}_{last_label}",
             )
             st.plotly_chart(
                 fig_k,

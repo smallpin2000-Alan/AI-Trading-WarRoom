@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 14
+    VERSION = 15
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -478,63 +478,29 @@ class TaishinQuoteFeed:
                         except Exception:
                             pass
 
-                # Step B: 透過 0 秒延遲即時分 K 通道補齊今日最新 1m K 棒與即時報價 (強制轉台灣時間 UTC+8)
+                # Step B: 透過 0 秒延遲即時分 K 通道補齊今日最新 1m K 棒與即時報價 (強制轉台灣時間 UTC+8，含雙次自動重試)
                 t_list, o_list, h_list, l_list, c_list, v_list = [], [], [], [], [], []
                 live_p = 0.0
-                try:
-                    r_rt = requests.get(
-                        f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol=TWS:{symbol}:STOCK&quote=1",
-                        headers=headers,
-                        timeout=5,
-                    )
-                    d_rt = (r_rt.json().get("data") or {})
-                    t_list = d_rt.get("t") or []
-                    o_list = d_rt.get("o") or []
-                    h_list = d_rt.get("h") or []
-                    l_list = d_rt.get("l") or []
-                    c_list = d_rt.get("c") or []
-                    v_list = d_rt.get("v") or []
-                    q_info = d_rt.get("quote") or {}
-                    live_p = float(q_info.get("6") or 0.0)
-                except Exception:
-                    pass
-
-                # 若即時分 K 通道暫時無回應，自動使用 Yahoo Finance 1d 1m 與即時報價備援
-                if not t_list and live_p <= 0:
-                    for sfx in (".TW", ".TWO"):
-                        try:
-                            ry = requests.get(
-                                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{sfx}?interval=1m&range=1d",
-                                headers=headers,
-                                timeout=5,
-                            )
-                            res_y = (ry.json().get("chart") or {}).get("result") or []
-                            if res_y:
-                                meta_y = res_y[0].get("meta") or {}
-                                live_p = float(meta_y.get("regularMarketPrice") or 0.0)
-                                ts_y = res_y[0].get("timestamp") or []
-                                q_y = (res_y[0].get("indicators", {}).get("quote") or [{}])[0]
-                                with self.lock:
-                                    for idx, ts_val in enumerate(ts_y):
-                                        cv = (q_y.get("close") or [None])[idx]
-                                        if cv is None or float(cv) <= 0:
-                                            continue
-                                        dt = _from_ts_tw(ts_val)
-                                        if not ((9, 0) <= (dt.hour, dt.minute) <= (13, 35)):
-                                            continue
-                                        self.kbars_1m[dt] = {
-                                            "timestamp": dt,
-                                            "open": float((q_y.get("open") or [cv])[idx] or cv),
-                                            "high": float((q_y.get("high") or [cv])[idx] or cv),
-                                            "low": float((q_y.get("low") or [cv])[idx] or cv),
-                                            "close": float(cv),
-                                            "volume": max(1, int(float((q_y.get("volume") or [1000])[idx] or 1000) / 1000)),
-                                        }
-                                        added += 1
-                                        pulled_live += 1
-                                break
-                        except Exception:
-                            pass
+                for _attempt in range(2):
+                    try:
+                        r_rt = requests.get(
+                            f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol=TWS:{symbol}:STOCK&quote=1",
+                            headers=headers,
+                            timeout=5,
+                        )
+                        d_rt = (r_rt.json().get("data") or {})
+                        t_list = d_rt.get("t") or []
+                        o_list = d_rt.get("o") or []
+                        h_list = d_rt.get("h") or []
+                        l_list = d_rt.get("l") or []
+                        c_list = d_rt.get("c") or []
+                        v_list = d_rt.get("v") or []
+                        q_info = d_rt.get("quote") or {}
+                        live_p = float(q_info.get("6") or 0.0)
+                        if t_list or live_p > 0:
+                            break
+                    except Exception:
+                        time.sleep(0.2)
 
                 now_tw = _now_tw()
                 now_bar_dt = now_tw.replace(second=0, microsecond=0)
@@ -561,6 +527,27 @@ class TaishinQuoteFeed:
                         }
                         added += 1
                         pulled_live += 1
+
+                    # 若當日盤中分 K 因外部上游瞬斷存在 2~25 分鐘小缺口，自動平滑補齊確保 5m K 線連續不斷根
+                    today_dts = sorted(dt for dt in self.kbars_1m.keys() if dt.date() == today_date)
+                    for idx_d in range(len(today_dts) - 1):
+                        d1, d2 = today_dts[idx_d], today_dts[idx_d + 1]
+                        diff_m = int((d2 - d1).total_seconds() // 60)
+                        if 1 < diff_m <= 25:
+                            p1 = float(self.kbars_1m[d1]["close"])
+                            p2 = float(self.kbars_1m[d2]["open"])
+                            for step_m in range(1, diff_m):
+                                f_dt = d1 + datetime.timedelta(minutes=step_m)
+                                if f_dt not in self.kbars_1m and (9, 0) <= (f_dt.hour, f_dt.minute) <= (13, 30):
+                                    interp_p = round(p1 + (p2 - p1) * (step_m / diff_m), 2)
+                                    self.kbars_1m[f_dt] = {
+                                        "timestamp": f_dt,
+                                        "open": interp_p,
+                                        "high": interp_p,
+                                        "low": interp_p,
+                                        "close": interp_p,
+                                        "volume": 1,
+                                    }
 
                     if self.kbars_1m:
                         last_dt = max(self.kbars_1m.keys())
@@ -1089,10 +1076,11 @@ class TaishinQuoteFeed:
             if timeframe == "1m":
                 return df_1m
 
-            return (
+            df_agg = (
                 df_1m.group_by_dynamic("timestamp", every=timeframe, closed="left", label="left")
                 .agg(
                     [
+                        pl.col("timestamp").last().alias("_last_1m_ts"),
                         pl.col("open").first().alias("open"),
                         pl.col("high").max().alias("high"),
                         pl.col("low").min().alias("low"),
@@ -1102,6 +1090,12 @@ class TaishinQuoteFeed:
                 )
                 .filter(pl.col("volume") > 0)
             )
+            if df_agg.height > 0:
+                # 讓最後一根正在成形的 K 棒直接標示為最新一分鐘時間 (例如 11:54 而非 11:50 起點)
+                ts_list = df_agg["timestamp"].to_list()
+                ts_list[-1] = df_agg["_last_1m_ts"][-1]
+                df_agg = df_agg.with_columns(pl.Series("timestamp", ts_list)).drop("_last_1m_ts")
+            return df_agg
 
         if not ticks:
             return self._empty_bars_df()
