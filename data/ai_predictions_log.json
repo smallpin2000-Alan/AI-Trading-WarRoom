@@ -372,5 +372,49 @@
     "ts": 1793780699.4,
     "time_str": "2026-11-04 16:24:59",
     "status": "PENDING"
+  },
+  {
+    "symbol": "MTXR1",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 43685.0,
+    "target_price": 43781.2,
+    "stop_loss": 43578.2,
+    "ts": 1793781143.1,
+    "time_str": "2026-11-04 16:32:23",
+    "status": "PENDING"
+  },
+  {
+    "symbol": "TMF",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 20518.0,
+    "target_price": 20553.0,
+    "stop_loss": 20488.0,
+    "ts": 1793782346.9,
+    "time_str": "2026-11-04 16:52:26",
+    "status": "PENDING"
+  },
+  {
+    "symbol": "TMFR1",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 22350.0,
+    "target_price": 22377.5,
+    "stop_loss": 22312.5,
+    "ts": 1793782346.9,
+    "time_str": "2026-11-04 16:52:26",
+    "status": "PENDING"
+  },
+  {
+    "symbol": "MTXR1",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 43477.5,
+    "target_price": 43552.1,
+    "stop_loss": 43421.6,
+    "ts": 1793782346.9,
+    "time_str": "2026-11-04 16:52:26",
+    "status": "PENDING"
   }
 ]

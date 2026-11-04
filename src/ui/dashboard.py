@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.0"
+APP_VERSION = "v2.7.1"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -433,32 +433,30 @@ def main():
             banner_rationale = advice.rationale
 
         # AI 決策大橫幅卡片（整合台新 Nova API 量化三要素：【指標】➔【訊號】➔【方法】＋ 近期回測獲利因子）
+        # 注意：禁止任何開頭 4 空白縮排，避免被 Streamlit 誤判為 <pre><code> 程式碼區塊
         taishin_tri_block = ""
         if is_mkt_open and getattr(advice, "indicator_summary", ""):
-            taishin_tri_block = f"""
-            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.16); font-size: 13.5px; color: #cfd8dc; line-height: 1.65;">
-                <div>📐 <b>【指標 (Indicator)】：</b>{advice.indicator_summary}</div>
-                <div>🚦 <b>【訊號 (Signal)】：</b>{advice.signal_summary}</div>
-                <div>🎯 <b>【方法 (Method)】：</b>{advice.method_summary}</div>
-                <div style="color: #40c4ff; margin-top: 2px;">📊 <b>【近期 K 棒回測驗證】：</b>{advice.backtest_summary}</div>
-            </div>
-            """
+            taishin_tri_block = (
+                '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.16); font-size: 13.5px; color: #cfd8dc; line-height: 1.65;">'
+                f'<div>📐 <b>【指標 (Indicator)】：</b>{advice.indicator_summary}</div>'
+                f'<div>🚦 <b>【訊號 (Signal)】：</b>{advice.signal_summary}</div>'
+                f'<div>🎯 <b>【方法 (Method)】：</b>{advice.method_summary}</div>'
+                f'<div style="color: #40c4ff; margin-top: 2px;">📊 <b>【近期 K 棒回測驗證】：</b>{advice.backtest_summary}</div>'
+                '</div>'
+            )
 
-        st.markdown(f"""
-        <div style="background-color: {bg_color}; border: 2px solid {box_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 18px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
-                <span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📌 分析標的：{ts_symbol} &nbsp;|&nbsp; 週期：{chart_tf} &nbsp;|&nbsp; 市場狀態：{advice.regime_label if is_mkt_open else "🌙 已收盤休市"}</span>
-                <span style="font-size: 13px; color: #848e9c;">分析引擎：{advice.source if is_mkt_open else "收盤休市模式"} (更新於 {advice.generated_at})</span>
-            </div>
-            <div style="font-size: 28px; font-weight: 800; color: {box_color}; margin: 8px 0 12px 0;">
-                {banner_title}
-            </div>
-            <div style="font-size: 15.5px; color: #e0e3eb; line-height: 1.65;">
-                💬 <b>{"AI 盤勢解讀與建議理由" if is_mkt_open else "收盤狀態說明"}：</b>{banner_rationale}
-            </div>
-            {taishin_tri_block}
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="background-color: {bg_color}; border: 2px solid {box_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 18px;">'
+            '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">'
+            f'<span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📌 分析標的：{ts_symbol} &nbsp;|&nbsp; 週期：{chart_tf} &nbsp;|&nbsp; 市場狀態：{advice.regime_label if is_mkt_open else "🌙 已收盤休市"}</span>'
+            f'<span style="font-size: 13px; color: #848e9c;">分析引擎：{advice.source if is_mkt_open else "收盤休市模式"} (更新於 {advice.generated_at})</span>'
+            '</div>'
+            f'<div style="font-size: 28px; font-weight: 800; color: {box_color}; margin: 8px 0 12px 0;">{banner_title}</div>'
+            f'<div style="font-size: 15.5px; color: #e0e3eb; line-height: 1.65;">💬 <b>{"AI 盤勢解讀與建議理由" if is_mkt_open else "收盤狀態說明"}：</b>{banner_rationale}</div>'
+            f'{taishin_tri_block}'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
         # 5 張關鍵作戰指標卡片
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -726,30 +724,31 @@ def main():
                     arrowsize=1,
                     arrowwidth=1.5,
                     arrowcolor=proj_color,
-                    ax=0,
+                    ax=-26,  # 稍微向左偏置，徹底杜絕文字框被畫布右邊緣切掉
                     ay=-28 if advice.action != "SELL_SHORT" else 28,
-                    font=dict(color="#ffffff", size=12),
-                    bgcolor="rgba(20, 24, 35, 0.85)",
+                    font=dict(color="#ffffff", size=11.5),
+                    bgcolor="rgba(20, 24, 35, 0.88)",
                     bordercolor=proj_color,
                     borderwidth=1,
                     borderpad=4,
                 )
 
             # 由最後一根最新 K 棒 (total_k - 1) 往回取固定間距刻度，確保最新 K 棒時間 100% 顯示在 X 軸上絕不跳格！
-            tick_step = max(1, vis_count // 18)
+            # 關鍵防重疊：未來預估僅顯示終點「AI預估+5」，移除「+2」，徹底消除與最新時間擠在一起的斜放重疊！
+            tick_step = max(1, vis_count // 16)
             tick_indices = list(range(total_k - 1, -1, -tick_step))[::-1]
             all_time_labels = df_plot["time_label"].tolist()
             if is_mkt_open:
-                explicit_tickvals = [all_time_labels[idx] for idx in tick_indices] + [future_labels[1], future_labels[4]]
-                x_max_range = total_k + len(future_labels) + 0.5
+                explicit_tickvals = [all_time_labels[idx] for idx in tick_indices] + [future_labels[-1]]
+                x_max_range = total_k + len(future_labels) + 0.8
             else:
                 explicit_tickvals = [all_time_labels[idx] for idx in tick_indices]
                 x_max_range = total_k - 0.2
 
             fig_k.update_layout(
                 template="plotly_dark",
-                height=500,
-                margin=dict(l=15, r=25, t=55, b=20),
+                height=520,
+                margin=dict(l=15, r=60, t=80, b=25),  # 頂部增高至 80px，右側加寬至 60px，徹底杜絕標籤被切與頂部按鈕遮擋
                 xaxis_rangeslider_visible=False,
                 xaxis=dict(
                     type="category",
@@ -758,21 +757,21 @@ def main():
                     ticktext=explicit_tickvals,
                     range=[init_start - 0.5, x_max_range],
                     minallowed=-0.5,
-                    maxallowed=x_max_range + 1.0,
+                    maxallowed=x_max_range + 1.2,
                 ),
                 yaxis=dict(
                     range=[y_min - y_pad, y_max + y_pad],
                     fixedrange=False,
                 ),
-                # 圖例改為靠左對齊 (x=0)，完全避開右上角的 Plotly 相機/縮放工具列
+                # 圖例置於圖表正上方左側，並與右上角相機工具列徹底分開
                 legend=dict(
                     orientation="h",
                     yanchor="bottom",
-                    y=1.02,
+                    y=1.03,
                     xanchor="left",
                     x=0,
                     bgcolor="rgba(0,0,0,0)",
-                    font=dict(size=12),
+                    font=dict(size=11),
                 ),
                 dragmode="pan",
                 uirevision=f"unified_k_{clean_sym}_{chart_tf}_{vis_bars_opt}_{last_label}",
