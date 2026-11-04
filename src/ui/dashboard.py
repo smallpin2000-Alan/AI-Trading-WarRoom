@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.5.2"
+APP_VERSION = "v2.6.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -305,6 +305,7 @@ def main():
         sync_info = feed.get_server_sync_info(clean_sym)
         df_bars = feed.get_bars(timeframe=chart_tf, session="day_and_night")
         is_fut = FuturesAIAdvisor.is_futures(clean_sym)
+        is_mkt_open, mkt_status_label = FuturesAIAdvisor.get_market_session_status(clean_sym)
         unit = "點" if is_fut else "元"
 
         latest_tk = feed.get_latest_tick()
@@ -352,8 +353,8 @@ def main():
                 )
                 global_advice_cache[advice_key] = (0.0, bar_sig, advice)
 
-            # 背景執行緒非阻塞呼叫 Gemini 2.5 Flash 深度分析，算完自動更新全域快取
-            if advice_key not in _refreshing_advice_keys and df_bars.height >= 10:
+            # 背景執行緒非阻塞呼叫 Gemini 2.5 Flash 深度分析 (僅在開盤交易時段執行，收盤後不再重複呼叫預估)
+            if is_mkt_open and advice_key not in _refreshing_advice_keys and df_bars.height >= 10:
                 _refreshing_advice_keys.add(advice_key)
                 _df_copy = df_bars.clone()
                 _sym_copy = clean_sym
@@ -404,45 +405,63 @@ def main():
 
         st.markdown(f"""
         <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
-            <div><b>📡 伺服器同步狀態：</b><span style="color: {sync_border}; font-weight: 700;">{sync_badge}</span></div>
+            <div><b>📡 伺服器同步狀態：</b><span style="color: {sync_border}; font-weight: 700;">{sync_badge}</span> &nbsp;|&nbsp; <b>{mkt_status_label}</b></div>
             <div>🕒 <b>伺服器最後更新時間：</b><span style="color: #40c4ff; font-weight: 700;">{sync_info['pull_time_str']} (台灣時間)</span> &nbsp;|&nbsp; 📊 <b>最新 K 棒時間：</b><span style="color: #f0b90b; font-weight: 700;">{bar_display_label}</span> &nbsp;|&nbsp; 🔗 <b>來源：</b>{sync_info['source']}</div>
         </div>
         """, unsafe_allow_html=True)
 
-        # 顏色主題設定
-        if advice.action == "BUY_LONG":
-            box_color = "#089981"
-            bg_color = "rgba(8, 153, 129, 0.14)"
-        elif advice.action == "SELL_SHORT":
-            box_color = "#f23645"
-            bg_color = "rgba(242, 54, 69, 0.14)"
+        # 顏色主題與收盤休市狀態設定
+        if not is_mkt_open:
+            box_color = "#64b5f6"
+            bg_color = "rgba(100, 181, 246, 0.10)"
+            banner_title = f"🌙 {mkt_status_label} — 已停止交易（暫停盤中 AI 預估）"
+            banner_rationale = (
+                f"目前 `{ts_symbol}` 已收盤停止交易，最後收盤價為 <b>{curr_price:,.1f} {unit}</b>（最後 K 棒時間：{bar_display_label}）。"
+                f"收盤休市期間系統已自動關閉盤中 AI 預估走勢線與即時進場訊號；待下一交易時段開盤後將自動恢復即時預估。"
+            )
         else:
-            box_color = "#f0b90b"
-            bg_color = "rgba(240, 185, 11, 0.14)"
+            if advice.action == "BUY_LONG":
+                box_color = "#089981"
+                bg_color = "rgba(8, 153, 129, 0.14)"
+            elif advice.action == "SELL_SHORT":
+                box_color = "#f23645"
+                bg_color = "rgba(242, 54, 69, 0.14)"
+            else:
+                box_color = "#f0b90b"
+                bg_color = "rgba(240, 185, 11, 0.14)"
+            banner_title = advice.action_label
+            banner_rationale = advice.rationale
 
         # AI 決策大橫幅卡片
         st.markdown(f"""
         <div style="background-color: {bg_color}; border: 2px solid {box_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 18px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
-                <span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📌 分析標的：{ts_symbol} &nbsp;|&nbsp; 週期：{chart_tf} &nbsp;|&nbsp; 市場狀態：{advice.regime_label}</span>
-                <span style="font-size: 13px; color: #848e9c;">分析引擎：{advice.source} (更新於 {advice.generated_at})</span>
+                <span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📌 分析標的：{ts_symbol} &nbsp;|&nbsp; 週期：{chart_tf} &nbsp;|&nbsp; 市場狀態：{advice.regime_label if is_mkt_open else "🌙 已收盤休市"}</span>
+                <span style="font-size: 13px; color: #848e9c;">分析引擎：{advice.source if is_mkt_open else "收盤休市模式"} (更新於 {advice.generated_at})</span>
             </div>
             <div style="font-size: 28px; font-weight: 800; color: {box_color}; margin: 8px 0 12px 0;">
-                {advice.action_label}
+                {banner_title}
             </div>
             <div style="font-size: 15.5px; color: #e0e3eb; line-height: 1.65;">
-                💬 <b>AI 盤勢解讀與建議理由：</b>{advice.rationale}
+                💬 <b>{"AI 盤勢解讀與建議理由" if is_mkt_open else "收盤狀態說明"}：</b>{banner_rationale}
             </div>
         </div>
         """, unsafe_allow_html=True)
 
         # 5 張關鍵作戰指標卡片
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("最新成交價", f"{curr_price:,.1f} {unit}", f"單量 {curr_vol} | {curr_time_str}")
-        m2.metric("多空勝率評估", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta=f"{advice.long_probability - advice.short_probability:+.0f}%")
-        m3.metric("建議參考進場區間", advice.entry_zone)
-        m4.metric("關鍵防守停損線", advice.stop_loss)
-        m5.metric("短線目標 / 壓力點", advice.target_price)
+        if is_mkt_open:
+            m1.metric("最新成交價", f"{curr_price:,.1f} {unit}", f"單量 {curr_vol} | {curr_time_str}")
+            m2.metric("多空勝率評估", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta=f"{advice.long_probability - advice.short_probability:+.0f}%")
+            m3.metric("建議參考進場區間", advice.entry_zone)
+            m4.metric("關鍵防守停損線", advice.stop_loss)
+            m5.metric("短線目標 / 壓力點", advice.target_price)
+        else:
+            m1.metric("最新收盤價", f"{curr_price:,.1f} {unit}", f"收盤時間 {bar_display_label[-5:]}")
+            m2.metric("收盤多空結構", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta="已收盤")
+            m3.metric("建議參考進場區間", "🌙 已收盤暫停")
+            m4.metric("關鍵防守停損線", "🌙 已收盤暫停")
+            m5.metric("短線目標 / 壓力點", "🌙 已收盤暫停")
 
         # 🌐 Google 雲端四維度綜合情報雷達（精簡一列展示 + 展開詳情）
         win_rate_display = (
@@ -491,7 +510,10 @@ def main():
         # ==================== 3. 即時 K 線與 AI 預估走勢圖表 ====================
         k_top1, k_top2, k_top3 = st.columns([2.3, 1.0, 0.9])
         with k_top1:
-            st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與 AI 預估走勢圖")
+            if is_mkt_open:
+                st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與 AI 預估走勢圖")
+            else:
+                st.subheader(f"📈 {ts_symbol} — {chart_tf} 收盤 K 線圖（{mkt_status_label}）")
         with k_top2:
             st.caption(
                 f"📡 伺服器最後拉取：`{sync_info['pull_time_str']}`\n\n"
@@ -576,16 +598,17 @@ def main():
                 proj_color = "#ffd54f"
                 proj_name = "🤖 AI 預估走勢 (區間震盪)"
 
-            # 計算 Y 軸顯示範圍，確保 K 線與 AI 預估目標/停損線完整呈現
+            # 計算 Y 軸顯示範圍，確保 K 線（與開盤期間的 AI 預估目標/停損線）完整呈現
             vis_slice = df_plot.iloc[init_start:]
             y_candidates = [
                 float(vis_slice["low"].min()),
                 float(vis_slice["high"].max()),
             ]
-            if target_val > 0:
-                y_candidates.append(target_val)
-            if stop_val > 0:
-                y_candidates.append(stop_val)
+            if is_mkt_open:
+                if target_val > 0:
+                    y_candidates.append(target_val)
+                if stop_val > 0:
+                    y_candidates.append(stop_val)
             y_min = min(y_candidates)
             y_max = max(y_candidates)
             y_pad = max(1.0, (y_max - y_min) * 0.10)
@@ -618,66 +641,70 @@ def main():
                 name="20MA",
             ))
 
-            # 加入 AI 預估未來走勢軌跡線
-            fig_k.add_trace(go.Scatter(
-                x=proj_x,
-                y=proj_y,
-                mode="lines+markers",
-                line=dict(color=proj_color, width=2.8, dash="dash"),
-                marker=dict(size=6, color=proj_color, symbol="diamond"),
-                name=proj_name,
-            ))
-
-            # 加入 AI 目標價、建議進場價、防守停損線
-            if target_val > 0:
+            # 僅在「開盤交易中 (is_mkt_open == True)」時繪製 AI 預估未來走勢軌跡線與目標/停損線；收盤停止交易時自動隱藏！
+            if is_mkt_open:
                 fig_k.add_trace(go.Scatter(
-                    x=ref_x,
-                    y=[target_val] * len(ref_x),
-                    mode="lines",
-                    line=dict(color="#00e676", width=1.4, dash="dot"),
-                    name=f"🏆 AI 目標 ({target_val:,.1f})",
-                ))
-            if advice.action != "WAIT" and entry_val > 0:
-                fig_k.add_trace(go.Scatter(
-                    x=ref_x,
-                    y=[entry_val] * len(ref_x),
-                    mode="lines",
-                    line=dict(color="#40c4ff", width=1.3, dash="dashdot"),
-                    name=f"🎯 AI 進場 ({entry_val:,.1f})",
-                ))
-            if stop_val > 0:
-                fig_k.add_trace(go.Scatter(
-                    x=ref_x,
-                    y=[stop_val] * len(ref_x),
-                    mode="lines",
-                    line=dict(color="#ff5252", width=1.4, dash="dot"),
-                    name=f"🛑 AI 停損 ({stop_val:,.1f})",
+                    x=proj_x,
+                    y=proj_y,
+                    mode="lines+markers",
+                    line=dict(color=proj_color, width=2.8, dash="dash"),
+                    marker=dict(size=6, color=proj_color, symbol="diamond"),
+                    name=proj_name,
                 ))
 
-            # 在預估路徑終點加上直覺標籤
-            fig_k.add_annotation(
-                x=future_labels[-1],
-                y=proj_y[-1],
-                text=f"🤖 AI預估 {proj_y[-1]:,.1f}",
-                showarrow=True,
-                arrowhead=2,
-                arrowsize=1,
-                arrowwidth=1.5,
-                arrowcolor=proj_color,
-                ax=0,
-                ay=-28 if advice.action != "SELL_SHORT" else 28,
-                font=dict(color="#ffffff", size=12),
-                bgcolor="rgba(20, 24, 35, 0.85)",
-                bordercolor=proj_color,
-                borderwidth=1,
-                borderpad=4,
-            )
+                if target_val > 0:
+                    fig_k.add_trace(go.Scatter(
+                        x=ref_x,
+                        y=[target_val] * len(ref_x),
+                        mode="lines",
+                        line=dict(color="#00e676", width=1.4, dash="dot"),
+                        name=f"🏆 AI 目標 ({target_val:,.1f})",
+                    ))
+                if advice.action != "WAIT" and entry_val > 0:
+                    fig_k.add_trace(go.Scatter(
+                        x=ref_x,
+                        y=[entry_val] * len(ref_x),
+                        mode="lines",
+                        line=dict(color="#40c4ff", width=1.3, dash="dashdot"),
+                        name=f"🎯 AI 進場 ({entry_val:,.1f})",
+                    ))
+                if stop_val > 0:
+                    fig_k.add_trace(go.Scatter(
+                        x=ref_x,
+                        y=[stop_val] * len(ref_x),
+                        mode="lines",
+                        line=dict(color="#ff5252", width=1.4, dash="dot"),
+                        name=f"🛑 AI 停損 ({stop_val:,.1f})",
+                    ))
+
+                fig_k.add_annotation(
+                    x=future_labels[-1],
+                    y=proj_y[-1],
+                    text=f"🤖 AI預估 {proj_y[-1]:,.1f}",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=1.5,
+                    arrowcolor=proj_color,
+                    ax=0,
+                    ay=-28 if advice.action != "SELL_SHORT" else 28,
+                    font=dict(color="#ffffff", size=12),
+                    bgcolor="rgba(20, 24, 35, 0.85)",
+                    bordercolor=proj_color,
+                    borderwidth=1,
+                    borderpad=4,
+                )
 
             # 由最後一根最新 K 棒 (total_k - 1) 往回取固定間距刻度，確保最新 K 棒時間 100% 顯示在 X 軸上絕不跳格！
             tick_step = max(1, vis_count // 18)
             tick_indices = list(range(total_k - 1, -1, -tick_step))[::-1]
             all_time_labels = df_plot["time_label"].tolist()
-            explicit_tickvals = [all_time_labels[idx] for idx in tick_indices] + [future_labels[1], future_labels[4]]
+            if is_mkt_open:
+                explicit_tickvals = [all_time_labels[idx] for idx in tick_indices] + [future_labels[1], future_labels[4]]
+                x_max_range = total_k + len(future_labels) + 0.5
+            else:
+                explicit_tickvals = [all_time_labels[idx] for idx in tick_indices]
+                x_max_range = total_k - 0.2
 
             fig_k.update_layout(
                 template="plotly_dark",
@@ -689,9 +716,9 @@ def main():
                     tickmode="array",
                     tickvals=explicit_tickvals,
                     ticktext=explicit_tickvals,
-                    range=[init_start - 0.5, total_k + len(future_labels) + 0.5],
+                    range=[init_start - 0.5, x_max_range],
                     minallowed=-0.5,
-                    maxallowed=total_k + len(future_labels) + 1.5,
+                    maxallowed=x_max_range + 1.0,
                 ),
                 yaxis=dict(
                     range=[y_min - y_pad, y_max + y_pad],

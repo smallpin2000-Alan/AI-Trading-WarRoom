@@ -98,3 +98,23 @@ def test_cloud_intel_integration():
     assert advice.long_probability >= 50.0
 
 
+def test_market_session_status_open_and_close():
+    # 週三 10:30 -> 台股開盤、期貨日盤開盤
+    dt_open = datetime(2026, 11, 4, 10, 30)
+    assert FuturesAIAdvisor.get_market_session_status("2330", dt_open)[0] is True
+    assert FuturesAIAdvisor.get_market_session_status("TMFR1", dt_open)[0] is True
+
+    # 週三 14:26 -> 台股已收盤 (13:30)、期貨日盤已收盤 (13:45 ~ 15:00 休息)
+    dt_closed_afternoon = datetime(2026, 11, 4, 14, 26)
+    is_stk_open, stk_msg = FuturesAIAdvisor.get_market_session_status("2330", dt_closed_afternoon)
+    is_fut_open, fut_msg = FuturesAIAdvisor.get_market_session_status("TMFR1", dt_closed_afternoon)
+    assert is_stk_open is False and "已收盤" in stk_msg
+    assert is_fut_open is False and "15:00 夜盤開盤" in fut_msg
+
+    # 週三 15:30 -> 台股仍收盤、期貨夜盤開盤
+    dt_night = datetime(2026, 11, 4, 15, 30)
+    assert FuturesAIAdvisor.get_market_session_status("2330", dt_night)[0] is False
+    assert FuturesAIAdvisor.get_market_session_status("TMFR1", dt_night)[0] is True
+
+
+

@@ -96,6 +96,42 @@ class FuturesAIAdvisor:
         return any(k in s for k in ["TMF", "TXF", "MTX", "MXF", "TX", "MT"]) or "R1" in s or "R2" in s
 
     @classmethod
+    def get_market_session_status(cls, symbol: str, now_dt: Optional[Any] = None) -> tuple[bool, str]:
+        """
+        判斷指定商品目前是否處於開盤交易時段 (台灣時間 UTC+8)：
+        - 回傳: (is_open: bool, status_label: str)
+        """
+        import datetime as _dt
+        if now_dt is None:
+            now_dt = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).replace(tzinfo=None)
+        wk = now_dt.weekday()
+        hm = (now_dt.hour, now_dt.minute)
+        is_fut = cls.is_futures(symbol)
+
+        if not is_fut:
+            # 台股個股 / ETF：週一至週五 09:00 ~ 13:30
+            if wk < 5 and (9, 0) <= hm <= (13, 30):
+                return True, "🟢 台股盤中交易中 (09:00~13:30)"
+            if wk >= 5:
+                return False, "🌙 台股週末休市中（週一 09:00 開盤）"
+            if hm > (13, 30):
+                return False, "🌙 台股今日已收盤 (13:30 停止交易)"
+            return False, "🌙 台股尚未開盤 (09:00 開盤)"
+        else:
+            # 台指期貨：日盤 08:45 ~ 13:45，夜盤 15:00 ~ 隔日 05:00
+            if wk < 5 and (8, 45) <= hm <= (13, 45):
+                return True, "🟢 期貨日盤交易中 (08:45~13:45)"
+            if wk < 5 and hm >= (15, 0):
+                return True, "🟢 期貨夜盤交易中 (15:00~05:00)"
+            if 1 <= wk <= 5 and hm <= (5, 0):
+                return True, "🟢 期貨夜盤交易中 (15:00~05:00)"
+            if wk < 5 and (13, 45) < hm < (15, 0):
+                return False, "🌙 期貨日盤已收盤（15:00 夜盤開盤）"
+            if (wk == 5 and hm > (5, 0)) or wk == 6 or (wk == 0 and hm < (8, 45)):
+                return False, "🌙 期貨週末休市中（週一 08:45 開盤）"
+            return False, "🌙 期貨夜盤已收盤（08:45 日盤開盤）"
+
+    @classmethod
     def analyze_market(
         cls,
         df_bars: pl.DataFrame,
@@ -245,15 +281,17 @@ class FuturesAIAdvisor:
                 cloud_intel=cloud_intel,
             )
             if advice:
-                levels = advice.extract_price_levels(fallback_price=curr_p)
-                CloudIntelligenceHub.record_prediction(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    action=advice.action,
-                    current_price=curr_p,
-                    target_val=levels["target"],
-                    stop_val=levels["stop_loss"],
-                )
+                is_open, _ = cls.get_market_session_status(symbol)
+                if is_open:
+                    levels = advice.extract_price_levels(fallback_price=curr_p)
+                    CloudIntelligenceHub.record_prediction(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        action=advice.action,
+                        current_price=curr_p,
+                        target_val=levels["target"],
+                        stop_val=levels["stop_loss"],
+                    )
                 return advice
 
         # 4. 本地量化回退分析 (當 Gemini 未設定或超時)
@@ -324,14 +362,16 @@ class FuturesAIAdvisor:
             generated_at=now_str,
             source="本地量化多空模型",
         )
-        CloudIntelligenceHub.record_prediction(
-            symbol=symbol,
-            timeframe=timeframe,
-            action=action,
-            current_price=curr_p,
-            target_val=tp_pt,
-            stop_val=sl_pt,
-        )
+        is_open, _ = cls.get_market_session_status(symbol)
+        if is_open:
+            CloudIntelligenceHub.record_prediction(
+                symbol=symbol,
+                timeframe=timeframe,
+                action=action,
+                current_price=curr_p,
+                target_val=tp_pt,
+                stop_val=sl_pt,
+            )
         return fallback_advice
 
     @classmethod

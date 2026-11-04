@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 15
+    VERSION = 16
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -729,15 +729,24 @@ class TaishinQuoteFeed:
         now_min = now.replace(second=0, microsecond=0)
         last_pull_dt = self._last_server_pull_dt.get(symbol)
         never_pulled = last_pull_dt is None
+
+        from src.ai.advisor import FuturesAIAdvisor
+        is_mkt_open, _ = FuturesAIAdvisor.get_market_session_status(symbol, now)
+
         is_stale = never_pulled
-        if last_pull_dt is not None and (now - last_pull_dt).total_seconds() >= 15:
-            is_stale = True
-        with self.lock:
-            if not self.kbars_1m:
+        if is_mkt_open:
+            if last_pull_dt is not None and (now - last_pull_dt).total_seconds() >= 15:
                 is_stale = True
-            else:
-                last_dt = max(self.kbars_1m.keys())
-                if last_dt.date() < now.date() or last_dt < now_min:
+            with self.lock:
+                if not self.kbars_1m:
+                    is_stale = True
+                else:
+                    last_dt = max(self.kbars_1m.keys())
+                    if last_dt.date() < now.date() or last_dt < now_min:
+                        is_stale = True
+        else:
+            with self.lock:
+                if not self.kbars_1m:
                     is_stale = True
 
         now_ts = time.time()
