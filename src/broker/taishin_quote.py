@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 13
+    VERSION = 14
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -479,20 +479,69 @@ class TaishinQuoteFeed:
                             pass
 
                 # Step B: 透過 0 秒延遲即時分 K 通道補齊今日最新 1m K 棒與即時報價 (強制轉台灣時間 UTC+8)
-                r_rt = requests.get(
-                    f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol=TWS:{symbol}:STOCK&quote=1",
-                    headers=headers,
-                    timeout=6,
+                t_list, o_list, h_list, l_list, c_list, v_list = [], [], [], [], [], []
+                live_p = 0.0
+                try:
+                    r_rt = requests.get(
+                        f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol=TWS:{symbol}:STOCK&quote=1",
+                        headers=headers,
+                        timeout=5,
+                    )
+                    d_rt = (r_rt.json().get("data") or {})
+                    t_list = d_rt.get("t") or []
+                    o_list = d_rt.get("o") or []
+                    h_list = d_rt.get("h") or []
+                    l_list = d_rt.get("l") or []
+                    c_list = d_rt.get("c") or []
+                    v_list = d_rt.get("v") or []
+                    q_info = d_rt.get("quote") or {}
+                    live_p = float(q_info.get("6") or 0.0)
+                except Exception:
+                    pass
+
+                # 若即時分 K 通道暫時無回應，自動使用 Yahoo Finance 1d 1m 與即時報價備援
+                if not t_list and live_p <= 0:
+                    for sfx in (".TW", ".TWO"):
+                        try:
+                            ry = requests.get(
+                                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{sfx}?interval=1m&range=1d",
+                                headers=headers,
+                                timeout=5,
+                            )
+                            res_y = (ry.json().get("chart") or {}).get("result") or []
+                            if res_y:
+                                meta_y = res_y[0].get("meta") or {}
+                                live_p = float(meta_y.get("regularMarketPrice") or 0.0)
+                                ts_y = res_y[0].get("timestamp") or []
+                                q_y = (res_y[0].get("indicators", {}).get("quote") or [{}])[0]
+                                with self.lock:
+                                    for idx, ts_val in enumerate(ts_y):
+                                        cv = (q_y.get("close") or [None])[idx]
+                                        if cv is None or float(cv) <= 0:
+                                            continue
+                                        dt = _from_ts_tw(ts_val)
+                                        if not ((9, 0) <= (dt.hour, dt.minute) <= (13, 35)):
+                                            continue
+                                        self.kbars_1m[dt] = {
+                                            "timestamp": dt,
+                                            "open": float((q_y.get("open") or [cv])[idx] or cv),
+                                            "high": float((q_y.get("high") or [cv])[idx] or cv),
+                                            "low": float((q_y.get("low") or [cv])[idx] or cv),
+                                            "close": float(cv),
+                                            "volume": max(1, int(float((q_y.get("volume") or [1000])[idx] or 1000) / 1000)),
+                                        }
+                                        added += 1
+                                        pulled_live += 1
+                                break
+                        except Exception:
+                            pass
+
+                now_tw = _now_tw()
+                now_bar_dt = now_tw.replace(second=0, microsecond=0)
+                is_twse_open = (
+                    now_tw.weekday() < 5
+                    and (9, 0) <= (now_tw.hour, now_tw.minute) <= (13, 30)
                 )
-                d_rt = (r_rt.json().get("data") or {})
-                t_list = d_rt.get("t") or []
-                o_list = d_rt.get("o") or []
-                h_list = d_rt.get("h") or []
-                l_list = d_rt.get("l") or []
-                c_list = d_rt.get("c") or []
-                v_list = d_rt.get("v") or []
-                q_info = d_rt.get("quote") or {}
-                live_p = float(q_info.get("6") or 0.0)
 
                 with self.lock:
                     for i, ts_val in enumerate(t_list):
@@ -512,17 +561,45 @@ class TaishinQuoteFeed:
                         }
                         added += 1
                         pulled_live += 1
+
                     if self.kbars_1m:
                         last_dt = max(self.kbars_1m.keys())
                         last_b = self.kbars_1m[last_dt]
                         p_final = live_p if live_p > 0 else float(last_b["close"])
-                        last_b["close"] = p_final
-                        last_b["high"] = max(float(last_b["high"]), p_final)
-                        last_b["low"] = min(float(last_b["low"]), p_final)
+                        # 若目前正處於台股盤中交易時段 (09:00 ~ 13:30)，將當下最新報價直接生成/更新至當下分鐘 (now_bar_dt) 的 1m K 棒，消除 5 分鐘批次延遲！
+                        if is_twse_open and last_dt.date() == now_bar_dt.date() and last_dt < now_bar_dt:
+                            gap_mins = int((now_bar_dt - last_dt).total_seconds() // 60)
+                            prev_c = float(last_b["close"])
+                            if 1 <= gap_mins <= 15:
+                                for m_step in range(1, gap_mins):
+                                    fill_dt = last_dt + datetime.timedelta(minutes=m_step)
+                                    if fill_dt not in self.kbars_1m:
+                                        self.kbars_1m[fill_dt] = {
+                                            "timestamp": fill_dt,
+                                            "open": prev_c,
+                                            "high": prev_c,
+                                            "low": prev_c,
+                                            "close": prev_c,
+                                            "volume": 1,
+                                        }
+                            self.kbars_1m[now_bar_dt] = {
+                                "timestamp": now_bar_dt,
+                                "open": prev_c,
+                                "high": max(prev_c, p_final),
+                                "low": min(prev_c, p_final),
+                                "close": p_final,
+                                "volume": max(1, int(last_b["volume"])),
+                            }
+                            pulled_live += 1
+                        else:
+                            last_b["close"] = p_final
+                            last_b["high"] = max(float(last_b["high"]), p_final)
+                            last_b["low"] = min(float(last_b["low"]), p_final)
+
                         self.latest_tick = TickData(
-                            timestamp=_now_tw(),
+                            timestamp=now_tw,
                             price=p_final,
-                            volume=int(last_b["volume"]),
+                            volume=int(self.kbars_1m[max(self.kbars_1m.keys())]["volume"]),
                         )
                         if pulled_live > 0:
                             source_name = "台股 0 延遲即時分K伺服器"
@@ -662,19 +739,23 @@ class TaishinQuoteFeed:
             return
 
         now = _now_tw()
-        never_pulled = symbol not in self._last_server_pull_dt
+        now_min = now.replace(second=0, microsecond=0)
+        last_pull_dt = self._last_server_pull_dt.get(symbol)
+        never_pulled = last_pull_dt is None
         is_stale = never_pulled
+        if last_pull_dt is not None and (now - last_pull_dt).total_seconds() >= 15:
+            is_stale = True
         with self.lock:
             if not self.kbars_1m:
                 is_stale = True
             else:
                 last_dt = max(self.kbars_1m.keys())
-                if last_dt.date() < now.date() or (now - last_dt).total_seconds() > 60:
+                if last_dt.date() < now.date() or last_dt < now_min:
                     is_stale = True
 
         now_ts = time.time()
         last_sync = self._last_sync_ts.get(symbol, 0.0)
-        if is_stale and (never_pulled or (now_ts - last_sync >= 15.0)):
+        if is_stale and (never_pulled or (now_ts - last_sync >= 12.0)):
             self._last_sync_ts[symbol] = now_ts
             self._sync_realtime_kbars_and_quote(symbol)
         if not self.connected and (user_id or self.current_user_id) and (password or self.current_password):

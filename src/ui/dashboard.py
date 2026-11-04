@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.5.0"
+APP_VERSION = "v2.5.1"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -399,10 +399,17 @@ def main():
             sync_bg = "rgba(240, 185, 11, 0.12)"
             sync_badge = "🟡 尚未從伺服器拉取最新資料（目前顯示快取，請點擊上方「🚀 連線 / 重新 AI 分析」）"
 
+        latest_1m_str = sync_info["bar_time_str"] if sync_info["bar_time_str"] != "--" else last_bar_time_str
+        bar_display_label = (
+            f"{latest_1m_str}"
+            if chart_tf == "1m"
+            else f"{latest_1m_str} ({chart_tf} 當前K棒起點 {last_bar_time_str[-5:]})"
+        )
+
         st.markdown(f"""
         <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
             <div><b>📡 伺服器同步狀態：</b><span style="color: {sync_border}; font-weight: 700;">{sync_badge}</span></div>
-            <div>🕒 <b>伺服器最後更新時間：</b><span style="color: #40c4ff; font-weight: 700;">{sync_info['pull_time_str']} (台灣時間)</span> &nbsp;|&nbsp; 📊 <b>最新 K 棒時間：</b><span style="color: #f0b90b; font-weight: 700;">{last_bar_time_str}</span> &nbsp;|&nbsp; 🔗 <b>來源：</b>{sync_info['source']}</div>
+            <div>🕒 <b>伺服器最後更新時間：</b><span style="color: #40c4ff; font-weight: 700;">{sync_info['pull_time_str']} (台灣時間)</span> &nbsp;|&nbsp; 📊 <b>最新 K 棒時間：</b><span style="color: #f0b90b; font-weight: 700;">{bar_display_label}</span> &nbsp;|&nbsp; 🔗 <b>來源：</b>{sync_info['source']}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -492,7 +499,7 @@ def main():
         with k_top2:
             st.caption(
                 f"📡 伺服器最後拉取：`{sync_info['pull_time_str']}`\n\n"
-                f"📊 最新 K 棒：`{last_bar_time_str}`"
+                f"📊 最新 K 棒：`{bar_display_label}`"
             )
         with k_top3:
             vis_bars_opt = st.selectbox(
