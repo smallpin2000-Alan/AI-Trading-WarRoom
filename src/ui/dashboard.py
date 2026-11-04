@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.6.0"
+APP_VERSION = "v2.7.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -327,7 +327,7 @@ def main():
         )
 
         # 計算或讀取 AI 決策建議（採用 SWR 零等待架構：先以 0.01 秒顯示現有快取或極速量化結果，背景執行緒非阻塞呼叫 Gemini AI！）
-        advice_key = f"ai_advice_{clean_sym}_{chart_tf}"
+        advice_key = f"ai_advice_{APP_VERSION}_{clean_sym}_{chart_tf}"
         now_ts = time.time()
         bar_sig = f"{df_bars.height}_{last_bar_time_str}"
         cached_entry = global_advice_cache.get(advice_key)
@@ -338,10 +338,10 @@ def main():
         ):
             advice: FuturesAdvice = cached_entry[2]
         else:
-            if cached_entry is not None:
+            if cached_entry is not None and cached_entry[1] == bar_sig:
                 advice = cached_entry[2]
             else:
-                # 首次載入此商品：0.01 秒極速算出本地量化多空決策，絕不讓畫面卡住乾等 5 秒 Gemini API！
+                # 首次載入或 K 棒已推進：0.005 秒極速重算台新三積木（均線+布林+MACD+ATR）多空決策，絕不卡畫面！
                 advice = FuturesAIAdvisor.analyze_market(
                     df_bars=df_bars,
                     symbol=clean_sym,
@@ -432,7 +432,18 @@ def main():
             banner_title = advice.action_label
             banner_rationale = advice.rationale
 
-        # AI 決策大橫幅卡片
+        # AI 決策大橫幅卡片（整合台新 Nova API 量化三要素：【指標】➔【訊號】➔【方法】＋ 近期回測獲利因子）
+        taishin_tri_block = ""
+        if is_mkt_open and getattr(advice, "indicator_summary", ""):
+            taishin_tri_block = f"""
+            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.16); font-size: 13.5px; color: #cfd8dc; line-height: 1.65;">
+                <div>📐 <b>【指標 (Indicator)】：</b>{advice.indicator_summary}</div>
+                <div>🚦 <b>【訊號 (Signal)】：</b>{advice.signal_summary}</div>
+                <div>🎯 <b>【方法 (Method)】：</b>{advice.method_summary}</div>
+                <div style="color: #40c4ff; margin-top: 2px;">📊 <b>【近期 K 棒回測驗證】：</b>{advice.backtest_summary}</div>
+            </div>
+            """
+
         st.markdown(f"""
         <div style="background-color: {bg_color}; border: 2px solid {box_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 18px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
@@ -445,6 +456,7 @@ def main():
             <div style="font-size: 15.5px; color: #e0e3eb; line-height: 1.65;">
                 💬 <b>{"AI 盤勢解讀與建議理由" if is_mkt_open else "收盤狀態說明"}：</b>{banner_rationale}
             </div>
+            {taishin_tri_block}
         </div>
         """, unsafe_allow_html=True)
 
@@ -455,13 +467,13 @@ def main():
             m2.metric("多空勝率評估", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta=f"{advice.long_probability - advice.short_probability:+.0f}%")
             m3.metric("建議參考進場區間", advice.entry_zone)
             m4.metric("關鍵防守停損線", advice.stop_loss)
-            m5.metric("短線目標 / 壓力點", advice.target_price)
+            m5.metric("布林 / 短線目標點", advice.target_price)
         else:
             m1.metric("最新收盤價", f"{curr_price:,.1f} {unit}", f"收盤時間 {bar_display_label[-5:]}")
             m2.metric("收盤多空結構", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta="已收盤")
             m3.metric("建議參考進場區間", "🌙 已收盤暫停")
             m4.metric("關鍵防守停損線", "🌙 已收盤暫停")
-            m5.metric("短線目標 / 壓力點", "🌙 已收盤暫停")
+            m5.metric("布林 / 短線目標點", "🌙 已收盤暫停")
 
         # 🌐 Google 雲端四維度綜合情報雷達（精簡一列展示 + 展開詳情）
         win_rate_display = (
@@ -511,7 +523,7 @@ def main():
         k_top1, k_top2, k_top3 = st.columns([2.3, 1.0, 0.9])
         with k_top1:
             if is_mkt_open:
-                st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與 AI 預估走勢圖")
+                st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與布林通道 / AI 預估圖")
             else:
                 st.subheader(f"📈 {ts_symbol} — {chart_tf} 收盤 K 線圖（{mkt_status_label}）")
         with k_top2:
@@ -532,8 +544,11 @@ def main():
             df_plot["time_label"] = df_plot["timestamp"].dt.strftime("%m-%d %H:%M")
             df_plot["ma5"] = df_plot["close"].rolling(5).mean()
             df_plot["ma20"] = df_plot["close"].rolling(20).mean()
+            bb_std_s = df_plot["close"].rolling(20).std().fillna(0.0)
+            df_plot["bb_up"] = df_plot["ma20"] + 2.0 * bb_std_s
+            df_plot["bb_low"] = df_plot["ma20"] - 2.0 * bb_std_s
 
-            # 智慧傳輸瘦身：先算完完整均線後，若非選「全部顯示」，僅傳送最近 max(240, vis_count*2) 根至前端，減少 92% 網路傳輸量！
+            # 智慧傳輸瘦身：先算完完整均線與布林通道後，若非選「全部顯示」，僅傳送最近 max(240, vis_count*2) 根至前端
             if vis_bars_opt != "全部顯示":
                 req_vis = int(vis_bars_opt.split(" ")[0])
                 max_send = max(240, req_vis * 2)
@@ -543,67 +558,78 @@ def main():
             total_k = len(df_plot)
             vis_count = total_k if vis_bars_opt == "全部顯示" else min(total_k, int(vis_bars_opt.split(" ")[0]))
             init_start = max(0, total_k - vis_count)
-            init_end = max(0, total_k - 1)
 
             last_close = float(df_plot["close"].iloc[-1])
             last_label = str(df_plot["time_label"].iloc[-1])
+            recent_bar_atr = float((df_plot["high"].tail(14) - df_plot["low"].tail(14)).mean())
+            eff_atr = (
+                float(advice.atr_val)
+                if getattr(advice, "atr_val", 0.0) > 0
+                else max(12.0 if is_fut else 0.5, recent_bar_atr)
+            )
 
-            # 提取 AI 預估關鍵價位 (進場、停損、目標)
+            # 提取 AI 預估關鍵價位 (進場、停損、目標，已由 ATR 與布林通道雙重收斂校準)
             ai_levels = advice.extract_price_levels(fallback_price=last_close)
             entry_val = ai_levels["entry"]
             stop_val = ai_levels["stop_loss"]
             target_val = ai_levels["target"]
 
-            # 產生未來 5 根 K 棒的 AI 預估走勢座標
+            # 產生未來 5 根 K 棒的合理收斂預估走勢（依單根 ATR 波幅與布林通道邊界平滑推演，杜絕誇張 45 度衝天炮直線！）
             future_labels = [f"AI預估+{i}" for i in range(1, 6)]
             proj_x = [last_label] + future_labels
 
             if advice.action == "BUY_LONG":
-                # 偏多預估路徑：先測試進場支撐後穩步推升至 AI 目標價
-                step1 = min(last_close, entry_val) if entry_val > 0 else last_close
+                # 5 根 K 棒內最大合理推進距離以 1.25 倍 ATR 或目標價為上限，先微幅測試 5MA/支撐後溫和推升
+                end_5bar = min(target_val, last_close + eff_atr * 1.25)
+                delta_5 = max(0.0, end_5bar - last_close)
+                dip_1 = round(last_close - min(eff_atr * 0.15, max(0.0, last_close - entry_val) * 0.5), 1)
                 proj_y = [
                     last_close,
-                    round(last_close * 0.4 + step1 * 0.6, 1),
-                    round(last_close + (target_val - last_close) * 0.30, 1),
-                    round(last_close + (target_val - last_close) * 0.55, 1),
-                    round(last_close + (target_val - last_close) * 0.80, 1),
-                    round(target_val, 1),
+                    dip_1,
+                    round(last_close + delta_5 * 0.28, 1),
+                    round(last_close + delta_5 * 0.55, 1),
+                    round(last_close + delta_5 * 0.80, 1),
+                    round(end_5bar, 1),
                 ]
                 proj_color = "#00e676"
-                proj_name = "🤖 AI 預估走勢 (偏多)"
+                proj_name = "🤖 AI 預估走勢 (偏多溫和推升)"
             elif advice.action == "SELL_SHORT":
-                # 偏空預估路徑：先小幅反彈測試進場壓力後下探至 AI 目標價
-                step1 = max(last_close, entry_val) if entry_val > 0 else last_close
+                end_5bar = max(target_val, last_close - eff_atr * 1.25)
+                delta_5 = max(0.0, last_close - end_5bar)
+                bounce_1 = round(last_close + min(eff_atr * 0.15, max(0.0, entry_val - last_close) * 0.5), 1)
                 proj_y = [
                     last_close,
-                    round(last_close * 0.4 + step1 * 0.6, 1),
-                    round(last_close + (target_val - last_close) * 0.30, 1),
-                    round(last_close + (target_val - last_close) * 0.55, 1),
-                    round(last_close + (target_val - last_close) * 0.80, 1),
-                    round(target_val, 1),
+                    bounce_1,
+                    round(last_close - delta_5 * 0.28, 1),
+                    round(last_close - delta_5 * 0.55, 1),
+                    round(last_close - delta_5 * 0.80, 1),
+                    round(end_5bar, 1),
                 ]
                 proj_color = "#ff5252"
-                proj_name = "🤖 AI 預估走勢 (偏空)"
+                proj_name = "🤖 AI 預估走勢 (偏空溫和回測)"
             else:
-                # 觀望預估路徑：於區間內橫向震盪整理
-                amp = max(abs(target_val - last_close) * 0.25, last_close * 0.0015)
+                # 區間震盪 / 高檔鈍化整理：於 ±0.25 倍單根 ATR 內橫向微幅收斂
+                amp = round(eff_atr * 0.25, 1)
                 proj_y = [
                     last_close,
-                    round(last_close + amp * 0.6, 1),
-                    round(last_close - amp * 0.5, 1),
+                    round(last_close + amp * 0.8, 1),
+                    round(last_close - amp * 0.6, 1),
                     round(last_close + amp * 0.4, 1),
-                    round(last_close - amp * 0.3, 1),
+                    round(last_close - amp * 0.2, 1),
                     round(last_close, 1),
                 ]
                 proj_color = "#ffd54f"
-                proj_name = "🤖 AI 預估走勢 (區間震盪)"
+                proj_name = "🤖 AI 預估走勢 (區間收斂整理)"
 
-            # 計算 Y 軸顯示範圍，確保 K 線（與開盤期間的 AI 預估目標/停損線）完整呈現
+            # 計算 Y 軸顯示範圍，確保 K 線、布林通道與合理目標/停損線完整呈現且不被壓扁
             vis_slice = df_plot.iloc[init_start:]
             y_candidates = [
                 float(vis_slice["low"].min()),
                 float(vis_slice["high"].max()),
             ]
+            if not vis_slice["bb_up"].dropna().empty:
+                y_candidates.append(float(vis_slice["bb_up"].dropna().max()))
+                y_candidates.append(float(vis_slice["bb_low"].dropna().min()))
             if is_mkt_open:
                 if target_val > 0:
                     y_candidates.append(target_val)
@@ -611,7 +637,7 @@ def main():
                     y_candidates.append(stop_val)
             y_min = min(y_candidates)
             y_max = max(y_candidates)
-            y_pad = max(1.0, (y_max - y_min) * 0.10)
+            y_pad = max(1.0, (y_max - y_min) * 0.08)
 
             # 水平參考線橫跨最近 35 根 K 線至未來預估區間，畫面清晰不雜亂
             ref_start_idx = max(init_start, total_k - 35)
@@ -638,7 +664,19 @@ def main():
                 x=df_plot["time_label"],
                 y=df_plot["ma20"],
                 line=dict(color="#29b6f6", width=1.6),
-                name="20MA",
+                name="20MA(中軸成本)",
+            ))
+            fig_k.add_trace(go.Scatter(
+                x=df_plot["time_label"],
+                y=df_plot["bb_up"],
+                line=dict(color="rgba(186, 104, 200, 0.65)", width=1.2, dash="dot"),
+                name="布林上軌(2σ壓力)",
+            ))
+            fig_k.add_trace(go.Scatter(
+                x=df_plot["time_label"],
+                y=df_plot["bb_low"],
+                line=dict(color="rgba(186, 104, 200, 0.65)", width=1.2, dash="dot"),
+                name="布林下軌(2σ支撐)",
             ))
 
             # 僅在「開盤交易中 (is_mkt_open == True)」時繪製 AI 預估未來走勢軌跡線與目標/停損線；收盤停止交易時自動隱藏！
@@ -647,18 +685,19 @@ def main():
                     x=proj_x,
                     y=proj_y,
                     mode="lines+markers",
-                    line=dict(color=proj_color, width=2.8, dash="dash"),
+                    line=dict(color=proj_color, width=2.6, dash="dash"),
                     marker=dict(size=6, color=proj_color, symbol="diamond"),
                     name=proj_name,
                 ))
 
                 if target_val > 0:
+                    tp_lbl = f"🏆 布林/短線目標 ({target_val:,.1f})" if advice.action != "WAIT" else f"🔼 突破做多觸發線 ({target_val:,.1f})"
                     fig_k.add_trace(go.Scatter(
                         x=ref_x,
                         y=[target_val] * len(ref_x),
                         mode="lines",
                         line=dict(color="#00e676", width=1.4, dash="dot"),
-                        name=f"🏆 AI 目標 ({target_val:,.1f})",
+                        name=tp_lbl,
                     ))
                 if advice.action != "WAIT" and entry_val > 0:
                     fig_k.add_trace(go.Scatter(
@@ -666,21 +705,22 @@ def main():
                         y=[entry_val] * len(ref_x),
                         mode="lines",
                         line=dict(color="#40c4ff", width=1.3, dash="dashdot"),
-                        name=f"🎯 AI 進場 ({entry_val:,.1f})",
+                        name=f"🎯 參考進場 ({entry_val:,.1f})",
                     ))
                 if stop_val > 0:
+                    sl_lbl = f"🛑 防守停損 ({stop_val:,.1f})" if advice.action != "WAIT" else f"🔽 跌破做空觸發線 ({stop_val:,.1f})"
                     fig_k.add_trace(go.Scatter(
                         x=ref_x,
                         y=[stop_val] * len(ref_x),
                         mode="lines",
                         line=dict(color="#ff5252", width=1.4, dash="dot"),
-                        name=f"🛑 AI 停損 ({stop_val:,.1f})",
+                        name=sl_lbl,
                     ))
 
                 fig_k.add_annotation(
                     x=future_labels[-1],
                     y=proj_y[-1],
-                    text=f"🤖 AI預估 {proj_y[-1]:,.1f}",
+                    text=f"🤖 5根收斂預估 {proj_y[-1]:,.1f}",
                     showarrow=True,
                     arrowhead=2,
                     arrowsize=1,

@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 16
+    VERSION = 17
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -591,62 +591,64 @@ class TaishinQuoteFeed:
                         if pulled_live > 0:
                             source_name = "台股 0 延遲即時分K伺服器"
             else:
-                # 期貨 (TMFR1 / TXFR1 / MTXR1)
-                need_night_backfill = True
-                with self.lock:
-                    if len(self.kbars_1m) >= 400:
-                        last_dt_fut = max(self.kbars_1m.keys())
-                        if last_dt_fut.date() == today_date and symbol in self._last_server_pull_dt:
-                            need_night_backfill = False
+                # 期貨 (TMFR1 / TXFR1 / MTXR1)：先從連續日夜盤 1m K 棒伺服器拉取含精確 Unix Timestamp 之最新分 K
+                now_tw_fut = _now_tw()
+                is_night_fut = (now_tw_fut.hour >= 15) or (now_tw_fut.hour < 5) or (now_tw_fut.hour == 5 and now_tw_fut.minute == 0)
+                cnyes_fut = "TWF:TXF:FUTURES"
+                try:
+                    r_fut = requests.get(
+                        f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
+                        headers=headers,
+                        timeout=4,
+                    )
+                    d_fut = (r_fut.json().get("data") or {})
+                    t_list = d_fut.get("t") or []
+                    o_list = d_fut.get("o") or []
+                    h_list = d_fut.get("h") or []
+                    l_list = d_fut.get("l") or []
+                    c_list = d_fut.get("c") or []
+                    v_list = d_fut.get("v") or []
+                    if t_list:
+                        min_srv_dt = _from_ts_tw(min(int(x) for x in t_list))
+                        with self.lock:
+                            stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt]
+                            for sk in stale_keys:
+                                self.kbars_1m.pop(sk, None)
+                            for i, ts_val in enumerate(t_list):
+                                c_v = float(c_list[i] or 0.0)
+                                if c_v <= 0:
+                                    continue
+                                dt = _from_ts_tw(ts_val)
+                                self.kbars_1m[dt] = {
+                                    "timestamp": dt,
+                                    "open": float(o_list[i] or c_v),
+                                    "high": float(h_list[i] or c_v),
+                                    "low": float(l_list[i] or c_v),
+                                    "close": c_v,
+                                    "volume": max(1, int(float(v_list[i] or 1))),
+                                }
+                                added += 1
+                                pulled_live += 1
+                            if self.kbars_1m:
+                                last_dt_c = max(self.kbars_1m.keys())
+                                last_b_c = self.kbars_1m[last_dt_c]
+                                self.latest_tick = TickData(
+                                    timestamp=now_tw_fut,
+                                    price=float(last_b_c["close"]),
+                                    volume=int(last_b_c["volume"]),
+                                )
+                            source_name = "台指期連續夜日盤分K伺服器"
+                except Exception:
+                    pass
 
-                if need_night_backfill:
-                    cnyes_fut = "TWF:TXF:FUTURES"
-                    try:
-                        r_fut = requests.get(
-                            f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
-                            headers=headers,
-                            timeout=4,
-                        )
-                        d_fut = (r_fut.json().get("data") or {})
-                        t_list = d_fut.get("t") or []
-                        o_list = d_fut.get("o") or []
-                        h_list = d_fut.get("h") or []
-                        l_list = d_fut.get("l") or []
-                        c_list = d_fut.get("c") or []
-                        v_list = d_fut.get("v") or []
-                        if t_list:
-                            min_srv_dt = _from_ts_tw(min(int(x) for x in t_list))
-                            with self.lock:
-                                # 清除該區間內可能被舊版 UTC+0 污染的 K 棒，重新寫入純台灣時間 (UTC+8) K 棒
-                                stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt]
-                                for sk in stale_keys:
-                                    self.kbars_1m.pop(sk, None)
-                                for i, ts_val in enumerate(t_list):
-                                    c_v = float(c_list[i] or 0.0)
-                                    if c_v <= 0:
-                                        continue
-                                    dt = _from_ts_tw(ts_val)
-                                    self.kbars_1m[dt] = {
-                                        "timestamp": dt,
-                                        "open": float(o_list[i] or c_v),
-                                        "high": float(h_list[i] or c_v),
-                                        "low": float(l_list[i] or c_v),
-                                        "close": c_v,
-                                        "volume": max(1, int(float(v_list[i] or 1))),
-                                    }
-                                    added += 1
-                                    pulled_live += 1
-                                source_name = "台指期連續夜日盤分K伺服器"
-                    except Exception:
-                        pass
-
-                # 再從台灣期貨交易所官網 API (mis.taifex.com.tw) 取得該契約 0 秒延遲精準報價與當日 1m K 棒
+                # 再從台灣期貨交易所官網 API (mis.taifex.com.tw) 取得該契約 0 秒延遲精準報價（自動區分日盤 MarketType=0 與夜盤 MarketType=1）
                 cid = "TMF" if "TMF" in symbol else ("MXF" if ("MTX" in symbol or "MXF" in symbol) else "TXF")
+                mkt_type = "1" if is_night_fut else "0"
                 r_ql = requests.post(
                     "https://mis.taifex.com.tw/futures/api/getQuoteList",
-                    json={"MarketType": "0", "SymbolType": "F", "KindID": "1", "CID": cid},
+                    json={"MarketType": mkt_type, "SymbolType": "F", "KindID": "1", "CID": cid},
                     headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-                    timeout=6,
+                    timeout=5,
                 )
                 q_list = ((r_ql.json().get("RtData") or {}).get("QuoteList")) or []
                 front_q = next(
@@ -661,36 +663,49 @@ class TaishinQuoteFeed:
                 if front_q:
                     sym_id = front_q["SymbolID"]
                     last_p = float(front_q["CLastPrice"])
-                    r_1m = requests.post(
-                        "https://mis.taifex.com.tw/futures/api/getChartData1M",
-                        json={"SymbolID": sym_id, "MarketType": "0"},
-                        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-                        timeout=6,
-                    )
-                    rt_data = (r_1m.json().get("RtData") or {})
-                    c_date = str((rt_data.get("Quote") or {}).get("CDate") or today_date.strftime("%Y%m%d"))
-                    ticks_1m = rt_data.get("Ticks") or []
+                    if mkt_type == "0":
+                        r_1m = requests.post(
+                            "https://mis.taifex.com.tw/futures/api/getChartData1M",
+                            json={"SymbolID": sym_id, "MarketType": "0"},
+                            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+                            timeout=5,
+                        )
+                        rt_data = (r_1m.json().get("RtData") or {})
+                        c_date = str((rt_data.get("Quote") or {}).get("CDate") or today_date.strftime("%Y%m%d"))
+                        ticks_1m = rt_data.get("Ticks") or []
+                        with self.lock:
+                            for row in ticks_1m:
+                                if len(row) < 6:
+                                    continue
+                                t_hhmm = int(str(row[0]).strip()[:4] or 0)
+                                dt = self._parse_kbar_datetime(c_date, t_hhmm)
+                                if dt is None:
+                                    continue
+                                c_v = float(row[4] or 0.0)
+                                if c_v <= 0:
+                                    continue
+                                self.kbars_1m[dt] = {
+                                    "timestamp": dt,
+                                    "open": float(row[1] or c_v),
+                                    "high": float(row[2] or c_v),
+                                    "low": float(row[3] or c_v),
+                                    "close": c_v,
+                                    "volume": max(1, int(float(row[5] or 1))),
+                                }
+                                added += 1
+                                pulled_live += 1
+                    else:
+                        # 夜盤時段：將期交所最新成交價直接更新至最新一根 1m K 棒
+                        with self.lock:
+                            if self.kbars_1m:
+                                latest_k_dt = max(self.kbars_1m.keys())
+                                kb_last = self.kbars_1m[latest_k_dt]
+                                kb_last["close"] = last_p
+                                kb_last["high"] = max(float(kb_last["high"]), last_p)
+                                kb_last["low"] = min(float(kb_last["low"]), last_p)
+                                pulled_live += 1
+
                     with self.lock:
-                        for row in ticks_1m:
-                            if len(row) < 6:
-                                continue
-                            t_hhmm = int(str(row[0]).strip()[:4] or 0)
-                            dt = self._parse_kbar_datetime(c_date, t_hhmm)
-                            if dt is None:
-                                continue
-                            c_v = float(row[4] or 0.0)
-                            if c_v <= 0:
-                                continue
-                            self.kbars_1m[dt] = {
-                                "timestamp": dt,
-                                "open": float(row[1] or c_v),
-                                "high": float(row[2] or c_v),
-                                "low": float(row[3] or c_v),
-                                "close": c_v,
-                                "volume": max(1, int(float(row[5] or 1))),
-                            }
-                            added += 1
-                            pulled_live += 1
                         self.latest_tick = TickData(
                             timestamp=_now_tw(),
                             price=last_p,

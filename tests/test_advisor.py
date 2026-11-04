@@ -117,4 +117,43 @@ def test_market_session_status_open_and_close():
     assert FuturesAIAdvisor.get_market_session_status("TMFR1", dt_night)[0] is True
 
 
+def test_taishin_bollinger_atr_bounded_target_and_high_stalling():
+    """測試台新 Nova API 三要素架構：高檔觸及布林上軌橫盤時不亂喊衝天炮，且目標價嚴格受 ATR 與布林通道約束"""
+    now = datetime(2026, 11, 4, 15, 50)
+    dates = [now - timedelta(minutes=5 * i) for i in range(35)][::-1]
+    # 模擬前面從 42500 漲到 43475，但最後 6 根卡在 43465~43478 狹幅橫盤 (每根波幅約 25 點)
+    closes = [42500.0 + min(i, 28) * 34.5 for i in range(29)] + [43472.0, 43476.0, 43470.0, 43475.0, 43477.0, 43477.5]
+    opens = [c - 8.0 for c in closes]
+    highs = [c + 12.0 for c in closes]
+    lows = [c - 13.0 for c in closes]
+    vols = [300] * 29 + [120, 110, 95, 105, 90, 85]
+
+    df = pl.DataFrame({
+        "timestamp": dates,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": vols,
+    })
+
+    advice = FuturesAIAdvisor.analyze_market(df, symbol="MTXR1", timeframe="5m", fast_local_only=True)
+    levels = advice.extract_price_levels(fallback_price=43477.5)
+
+    # 1. 驗證台新三要素與回測獲利因子欄位皆已生成
+    assert "布林上軌" in advice.indicator_summary
+    assert "ATR" in advice.indicator_summary
+    assert "獲利因子(PF)" in advice.backtest_summary
+    assert advice.bb_upper > advice.bb_lower > 0
+    assert advice.atr_val > 0
+
+    # 2. 驗證目標價與停損價絕對不會出現舊版 +264 點 (0.6%) 的誇張距離，必須在 2.5 倍 ATR (約 70 點) 以內
+    target_dist = abs(levels["target"] - 43477.5)
+    stop_dist = abs(levels["stop_loss"] - 43477.5)
+    assert target_dist <= advice.atr_val * 2.5
+    assert stop_dist <= advice.atr_val * 2.0
+    assert target_dist < 90.0
+
+
+
 
