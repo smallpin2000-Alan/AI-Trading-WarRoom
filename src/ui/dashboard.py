@@ -148,7 +148,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.4.0"
+APP_VERSION = "v2.4.1"
 
 
 @st.cache_resource
@@ -305,6 +305,7 @@ def main():
     @st.fragment(run_every=auto_refresh_sec)
     def _render_unified_war_room():
         feed.ensure_fresh_data(clean_sym, actual_user, ts_pwd)
+        sync_info = feed.get_server_sync_info(clean_sym)
         df_bars = feed.get_bars(timeframe=chart_tf, session="day_and_night")
         is_fut = FuturesAIAdvisor.is_futures(clean_sym)
         unit = "點" if is_fut else "元"
@@ -312,10 +313,11 @@ def main():
         latest_tk = feed.get_latest_tick()
         curr_price = latest_tk.price if latest_tk else (float(df_bars["close"][-1]) if df_bars.height > 0 else 0.0)
         curr_vol = latest_tk.volume if latest_tk else (int(df_bars["volume"][-1]) if df_bars.height > 0 else 0)
+        last_bar_time_str = df_bars["timestamp"][-1].strftime("%Y-%m-%d %H:%M") if df_bars.height > 0 else "--"
         curr_time_str = (
             latest_tk.timestamp.strftime("%H:%M:%S")
             if latest_tk
-            else (df_bars["timestamp"][-1].strftime("%Y-%m-%d %H:%M") if df_bars.height > 0 else "--")
+            else last_bar_time_str
         )
 
         # 收集 Google 雲端四維度情報 (國際連動、即時新聞、GCS 法人籌碼、歷史預測勝率)
@@ -332,7 +334,7 @@ def main():
         if (
             cached_entry is not None
             and (now_ts - cached_entry[0] < 60.0)
-            and cached_entry[1] == df_bars.height
+            and cached_entry[1] == f"{df_bars.height}_{last_bar_time_str}"
         ):
             advice: FuturesAdvice = cached_entry[2]
         else:
@@ -344,8 +346,25 @@ def main():
                 gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
                 cloud_intel=intel_snap,
             )
-            global_advice_cache[advice_key] = (now_ts, df_bars.height, advice)
+            global_advice_cache[advice_key] = (now_ts, f"{df_bars.height}_{last_bar_time_str}", advice)
             gc.collect()
+
+        # 📡 伺服器資料拉取驗證狀態列（僅在確實從遠端伺服器拉到資料後才會顯示綠色與更新時間）
+        if sync_info["is_synced"]:
+            sync_border = "#089981"
+            sync_bg = "rgba(8, 153, 129, 0.12)"
+            sync_badge = f"🟢 已從伺服器拉取最新資料（{sync_info['seconds_ago']} 秒前驗證）"
+        else:
+            sync_border = "#f0b90b"
+            sync_bg = "rgba(240, 185, 11, 0.12)"
+            sync_badge = "🟡 尚未從伺服器拉取最新資料（目前顯示快取，請點擊上方「🚀 連線 / 重新 AI 分析」）"
+
+        st.markdown(f"""
+        <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
+            <div><b>📡 伺服器同步狀態：</b><span style="color: {sync_border}; font-weight: 700;">{sync_badge}</span></div>
+            <div>🕒 <b>伺服器最後更新時間：</b><span style="color: #40c4ff; font-weight: 700;">{sync_info['pull_time_str']} (台灣時間)</span> &nbsp;|&nbsp; 📊 <b>最新 K 棒時間：</b><span style="color: #f0b90b; font-weight: 700;">{last_bar_time_str}</span> &nbsp;|&nbsp; 🔗 <b>來源：</b>{sync_info['source']}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
         # 顏色主題設定
         if advice.action == "BUY_LONG":
@@ -431,7 +450,10 @@ def main():
         with k_top1:
             st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與 AI 預估走勢圖")
         with k_top2:
-            st.caption(f"連線狀態：{feed.status_msg}")
+            st.caption(
+                f"📡 伺服器最後拉取：`{sync_info['pull_time_str']}`\n\n"
+                f"📊 最新 K 棒：`{last_bar_time_str}`"
+            )
         with k_top3:
             vis_bars_opt = st.selectbox(
                 "畫面顯示 K 棒數量",

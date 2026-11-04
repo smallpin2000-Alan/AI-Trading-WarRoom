@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
+    TZ=Asia/Taipei \
     GCS_BUCKET=point-api-512405-stock-history
 
 COPY PY_TradeD-0.1.17.10-py3-none-any.whl /app/

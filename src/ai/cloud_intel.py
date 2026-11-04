@@ -8,6 +8,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import requests
@@ -101,7 +102,7 @@ class CloudIntelligenceHub:
 
         snap = CloudIntelSnapshot(
             symbol=clean_sym,
-            fetched_at=time.strftime("%H:%M:%S"),
+            fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
         )
 
         # 多執行緒同時平行抓取：1. 國際跨市場指標 + 2. Google News 即時新聞 + 3. GCS 法人籌碼

@@ -27,14 +27,32 @@ class KBarStore:
         clean = "".join(c for c in symbol.strip() if c.isalnum() or c in ("_", "-"))
         return self.data_dir / f"taishin_kbars_{clean}_1m.parquet"
 
-    def save_kbars(self, symbol: str, kbars_dict: Dict[datetime, Dict[str, Any]]) -> int:
+    def save_kbars(
+        self,
+        symbol: str,
+        kbars_dict: Dict[datetime, Dict[str, Any]],
+        replace_all: bool = False,
+        force_gcs: bool = False,
+    ) -> int:
         """將記憶體中的 1m K 棒與本地 Parquet 合併去重後寫入硬碟（並於雲端環境同步至 GCS）"""
         if not kbars_dict:
             return 0
         file_path = self._get_file_path(symbol)
+        is_stock = symbol.strip().isdigit()
 
-        merged: Dict[datetime, Dict[str, Any]] = self.load_kbars_dict(symbol)
-        merged.update(kbars_dict)
+        if replace_all:
+            merged: Dict[datetime, Dict[str, Any]] = dict(kbars_dict)
+        else:
+            merged = self.load_kbars_dict(symbol)
+            merged.update(kbars_dict)
+
+        if is_stock:
+            merged = {
+                dt: b for dt, b in merged.items()
+                if (9, 0) <= (dt.hour, dt.minute) <= (13, 35)
+            }
+        if not merged:
+            return 0
 
         sorted_bars = [merged[dt] for dt in sorted(merged.keys())]
         df = pl.DataFrame(
@@ -52,7 +70,7 @@ class KBarStore:
         # 若在 Cloud Run 雲端環境，於背景執行緒非阻塞上傳至 GCS 永久保存（每檔至少間隔 120 秒，絕不卡住前端網頁）
         now_ts = time.time()
         last_up = self._last_gcs_upload_ts.get(file_path.name, 0.0)
-        if (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and self.DEFAULT_GCS_BUCKET and (now_ts - last_up >= 120.0):
+        if (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and self.DEFAULT_GCS_BUCKET and (force_gcs or (now_ts - last_up >= 120.0)):
             self._last_gcs_upload_ts[file_path.name] = now_ts
             bucket_name = self.DEFAULT_GCS_BUCKET
             local_str = str(file_path)
@@ -75,6 +93,7 @@ class KBarStore:
     def load_kbars_dict(self, symbol: str) -> Dict[datetime, Dict[str, Any]]:
         """從本地 Parquet（或 Google Cloud Storage）讀取指定商品的台新真實 1m K 棒字典"""
         file_path = self._get_file_path(symbol)
+        is_stock = symbol.strip().isdigit()
         if not file_path.exists() and (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and self.DEFAULT_GCS_BUCKET:
             try:
                 from google.cloud import storage
@@ -93,6 +112,8 @@ class KBarStore:
             res: Dict[datetime, Dict[str, Any]] = {}
             for row in df.iter_rows(named=True):
                 dt = row["timestamp"]
+                if is_stock and not ((9, 0) <= (dt.hour, dt.minute) <= (13, 35)):
+                    continue
                 res[dt] = {
                     "timestamp": dt,
                     "open": float(row["open"]),

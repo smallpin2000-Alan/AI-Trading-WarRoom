@@ -105,7 +105,8 @@ class FuturesAIAdvisor:
         gemini_model: str = "gemini-2.5-flash",
         cloud_intel: Optional[CloudIntelSnapshot] = None,
     ) -> FuturesAdvice:
-        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        import datetime as _dt
+        now_str = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
         is_fut = cls.is_futures(symbol)
         asset_label = "台指期貨" if is_fut else "個股股票"
         unit = "點" if is_fut else "元"
