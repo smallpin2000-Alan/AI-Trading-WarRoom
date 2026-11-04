@@ -104,6 +104,7 @@ class FuturesAIAdvisor:
         gemini_api_key: str = "",
         gemini_model: str = "gemini-2.5-flash",
         cloud_intel: Optional[CloudIntelSnapshot] = None,
+        fast_local_only: bool = False,
     ) -> FuturesAdvice:
         import datetime as _dt
         now_str = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
@@ -222,9 +223,9 @@ class FuturesAIAdvisor:
         base_long_prob = round((long_score / total_s) * 100.0, 1)
         base_short_prob = round(100.0 - base_long_prob, 1)
 
-        # 3. 嘗試呼叫 Gemini 進行專業分析 (若有 API Key)
+        # 3. 嘗試呼叫 Gemini 進行專業分析 (若有 API Key 且非極速本地預覽模式)
         api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        if api_key:
+        if api_key and not fast_local_only:
             advice = cls._call_gemini_advisor(
                 api_key=api_key,
                 model_name=gemini_model,

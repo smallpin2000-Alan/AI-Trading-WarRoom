@@ -85,8 +85,10 @@ gcloud run deploy "${SERVICE_NAME}" \
   --allow-unauthenticated \
   --env-vars-file=env.yaml \
   --timeout 3600 \
-  --memory 1Gi \
-  --cpu 1 \
+  --memory 2Gi \
+  --cpu 2 \
+  --cpu-boost \
+  --session-affinity \
   --min-instances 0 \
   --max-instances 1
 

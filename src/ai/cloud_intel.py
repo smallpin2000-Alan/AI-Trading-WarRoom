@@ -75,6 +75,7 @@ class CloudIntelligenceHub:
     """
 
     _cache: Dict[str, tuple[float, Any]] = {}
+    _refreshing_keys: set[str] = set()
     CACHE_TTL_SEC = 120.0  # 2 分鐘快取，確保看盤流暢不卡頓
 
     DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "point-api-512405-stock-history").strip()
@@ -90,7 +91,37 @@ class CloudIntelligenceHub:
     ]
 
     @classmethod
-    def collect_all(cls, symbol: str, symbol_label: str = "", current_price: float = 0.0) -> CloudIntelSnapshot:
+    def _do_full_collect(cls, clean_sym: str, symbol_label: str, current_price: float) -> CloudIntelSnapshot:
+        snap = CloudIntelSnapshot(
+            symbol=clean_sym,
+            fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
+        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f1 = pool.submit(cls._populate_global_quotes, snap)
+            f2 = pool.submit(cls._populate_realtime_news, snap, clean_sym, symbol_label)
+            f3 = pool.submit(cls._populate_gcs_institutional, snap, clean_sym)
+            for fut in (f1, f2, f3):
+                try:
+                    fut.result(timeout=4.0)
+                except Exception:
+                    pass
+
+        if current_price > 0:
+            cls._update_and_evaluate_predictions(clean_sym, current_price, snap)
+        else:
+            cls._load_prediction_stats_only(clean_sym, snap)
+
+        cls._cache[f"intel_{clean_sym}"] = (time.time(), snap)
+        return snap
+
+    @classmethod
+    def collect_all(
+        cls,
+        symbol: str,
+        symbol_label: str = "",
+        current_price: float = 0.0,
+        allow_background: bool = False,
+    ) -> CloudIntelSnapshot:
         now_ts = time.time()
         clean_sym = (symbol or "TMF").strip().upper()
         cache_key = f"intel_{clean_sym}"
@@ -99,31 +130,41 @@ class CloudIntelligenceHub:
             cached_time, cached_snap = cls._cache[cache_key]
             if now_ts - cached_time < cls.CACHE_TTL_SEC:
                 return cached_snap
+            if allow_background:
+                if cache_key not in cls._refreshing_keys:
+                    cls._refreshing_keys.add(cache_key)
 
-        snap = CloudIntelSnapshot(
-            symbol=clean_sym,
-            fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
-        )
+                    def _bg_refresh():
+                        try:
+                            cls._do_full_collect(clean_sym, symbol_label, current_price)
+                        finally:
+                            cls._refreshing_keys.discard(cache_key)
 
-        # 多執行緒同時平行抓取：1. 國際跨市場指標 + 2. Google News 即時新聞 + 3. GCS 法人籌碼
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f1 = pool.submit(cls._populate_global_quotes, snap)
-            f2 = pool.submit(cls._populate_realtime_news, snap, clean_sym, symbol_label)
-            f3 = pool.submit(cls._populate_gcs_institutional, snap, clean_sym)
-            for fut in (f1, f2, f3):
-                try:
-                    fut.result(timeout=4.5)
-                except Exception:
-                    pass
+                    threading.Thread(target=_bg_refresh, daemon=True).start()
+                return cached_snap
 
-        # 4. 評估 AI 歷史預測準確率
-        if current_price > 0:
-            cls._update_and_evaluate_predictions(clean_sym, current_price, snap)
-        else:
-            cls._load_prediction_stats_only(clean_sym, snap)
+        if allow_background:
+            init_snap = CloudIntelSnapshot(
+                symbol=clean_sym,
+                fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
+                global_summary_text="⚡ 背景極速載入國際報價中...",
+                institutional_note="⚡ 背景同步雲端籌碼中...",
+            )
+            cls._load_prediction_stats_only(clean_sym, init_snap)
+            cls._cache[cache_key] = (0.0, init_snap)
+            if cache_key not in cls._refreshing_keys:
+                cls._refreshing_keys.add(cache_key)
 
-        cls._cache[cache_key] = (now_ts, snap)
-        return snap
+                def _bg_first():
+                    try:
+                        cls._do_full_collect(clean_sym, symbol_label, current_price)
+                    finally:
+                        cls._refreshing_keys.discard(cache_key)
+
+                threading.Thread(target=_bg_first, daemon=True).start()
+            return init_snap
+
+        return cls._do_full_collect(clean_sym, symbol_label, current_price)
 
     @classmethod
     def _populate_global_quotes(cls, snap: CloudIntelSnapshot) -> None:

@@ -4,6 +4,7 @@ import os
 import gc
 import json
 import time
+import threading
 from pathlib import Path
 import numpy as np
 import polars as pl
@@ -148,7 +149,8 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.4.1"
+APP_VERSION = "v2.5.0"
+_refreshing_advice_keys: set[str] = set()
 
 
 @st.cache_resource
@@ -179,11 +181,6 @@ def main():
     default_cfg = load_taishin_default_config()
     actual_user = default_cfg.get("sol_user_id", "")
     ts_pwd = default_cfg.get("sol_password", "")
-
-    # 首次啟動自動背景連線與當日最新 1m K 線補齊 (移除舊快取存在就不連線的限制)
-    if not st.session_state.get("auto_connect_attempted", False):
-        st.session_state["auto_connect_attempted"] = True
-        feed.ensure_fresh_data(feed.symbol, actual_user, ts_pwd)
 
     # 30 分鐘自動防呆休眠計時器 (避免忘記關網頁耗費雲端資源，確保 100% 0 元)
     if "last_active_time" not in st.session_state:
@@ -320,34 +317,77 @@ def main():
             else last_bar_time_str
         )
 
-        # 收集 Google 雲端四維度情報 (國際連動、即時新聞、GCS 法人籌碼、歷史預測勝率)
+        # 收集 Google 雲端四維度情報 (SWR 無阻塞背景更新架構，主執行緒 0.001 秒立即返回！)
         intel_snap = CloudIntelligenceHub.collect_all(
             symbol=clean_sym,
             symbol_label=ts_symbol,
             current_price=curr_price,
+            allow_background=True,
         )
 
-        # 計算或讀取 AI 決策建議（採用全伺服器跨訪客 60 秒共用快取，新訪客點開網址 0.001 秒直接秒開！）
+        # 計算或讀取 AI 決策建議（採用 SWR 零等待架構：先以 0.01 秒顯示現有快取或極速量化結果，背景執行緒非阻塞呼叫 Gemini AI！）
         advice_key = f"ai_advice_{clean_sym}_{chart_tf}"
         now_ts = time.time()
+        bar_sig = f"{df_bars.height}_{last_bar_time_str}"
         cached_entry = global_advice_cache.get(advice_key)
         if (
             cached_entry is not None
-            and (now_ts - cached_entry[0] < 60.0)
-            and cached_entry[1] == f"{df_bars.height}_{last_bar_time_str}"
+            and (now_ts - cached_entry[0] < 90.0)
+            and cached_entry[1] == bar_sig
         ):
             advice: FuturesAdvice = cached_entry[2]
         else:
-            advice = FuturesAIAdvisor.analyze_market(
-                df_bars=df_bars,
-                symbol=clean_sym,
-                timeframe=chart_tf,
-                gemini_api_key=default_cfg.get("gemini_api_key", ""),
-                gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
-                cloud_intel=intel_snap,
-            )
-            global_advice_cache[advice_key] = (now_ts, f"{df_bars.height}_{last_bar_time_str}", advice)
-            gc.collect()
+            if cached_entry is not None:
+                advice = cached_entry[2]
+            else:
+                # 首次載入此商品：0.01 秒極速算出本地量化多空決策，絕不讓畫面卡住乾等 5 秒 Gemini API！
+                advice = FuturesAIAdvisor.analyze_market(
+                    df_bars=df_bars,
+                    symbol=clean_sym,
+                    timeframe=chart_tf,
+                    gemini_api_key=default_cfg.get("gemini_api_key", ""),
+                    gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
+                    cloud_intel=intel_snap,
+                    fast_local_only=True,
+                )
+                global_advice_cache[advice_key] = (0.0, bar_sig, advice)
+
+            # 背景執行緒非阻塞呼叫 Gemini 2.5 Flash 深度分析，算完自動更新全域快取
+            if advice_key not in _refreshing_advice_keys and df_bars.height >= 10:
+                _refreshing_advice_keys.add(advice_key)
+                _df_copy = df_bars.clone()
+                _sym_copy = clean_sym
+                _lbl_copy = ts_symbol
+                _tf_copy = chart_tf
+                _p_copy = curr_price
+                _sig_copy = bar_sig
+                _key_copy = default_cfg.get("gemini_api_key", "")
+                _mdl_copy = default_cfg.get("gemini_model", "gemini-2.5-flash")
+
+                def _bg_compute_gemini():
+                    try:
+                        full_intel = CloudIntelligenceHub.collect_all(
+                            symbol=_sym_copy,
+                            symbol_label=_lbl_copy,
+                            current_price=_p_copy,
+                            allow_background=False,
+                        )
+                        full_adv = FuturesAIAdvisor.analyze_market(
+                            df_bars=_df_copy,
+                            symbol=_sym_copy,
+                            timeframe=_tf_copy,
+                            gemini_api_key=_key_copy,
+                            gemini_model=_mdl_copy,
+                            cloud_intel=full_intel,
+                            fast_local_only=False,
+                        )
+                        global_advice_cache[advice_key] = (time.time(), _sig_copy, full_adv)
+                    except Exception:
+                        pass
+                    finally:
+                        _refreshing_advice_keys.discard(advice_key)
+
+                threading.Thread(target=_bg_compute_gemini, daemon=True).start()
 
         # 📡 伺服器資料拉取驗證狀態列（僅在確實從遠端伺服器拉到資料後才會顯示綠色與更新時間）
         if sync_info["is_synced"]:
@@ -468,10 +508,10 @@ def main():
             df_plot["ma5"] = df_plot["close"].rolling(5).mean()
             df_plot["ma20"] = df_plot["close"].rolling(20).mean()
 
-            # 智慧傳輸瘦身：先算完完整均線後，若非選「全部顯示」，僅傳送最近 max(600, vis_count*3) 根至前端，減少 85% 網路傳輸量！
+            # 智慧傳輸瘦身：先算完完整均線後，若非選「全部顯示」，僅傳送最近 max(240, vis_count*2) 根至前端，減少 92% 網路傳輸量！
             if vis_bars_opt != "全部顯示":
                 req_vis = int(vis_bars_opt.split(" ")[0])
-                max_send = max(600, req_vis * 3)
+                max_send = max(240, req_vis * 2)
                 if len(df_plot) > max_send:
                     df_plot = df_plot.iloc[-max_send:].reset_index(drop=True)
 

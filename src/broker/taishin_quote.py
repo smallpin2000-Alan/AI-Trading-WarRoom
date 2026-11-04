@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 12
+    VERSION = 13
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -528,45 +528,53 @@ class TaishinQuoteFeed:
                             source_name = "台股 0 延遲即時分K伺服器"
             else:
                 # 期貨 (TMFR1 / TXFR1 / MTXR1)
-                cnyes_fut = "TWF:TXF:FUTURES"
-                try:
-                    r_fut = requests.get(
-                        f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
-                        headers=headers,
-                        timeout=6,
-                    )
-                    d_fut = (r_fut.json().get("data") or {})
-                    t_list = d_fut.get("t") or []
-                    o_list = d_fut.get("o") or []
-                    h_list = d_fut.get("h") or []
-                    l_list = d_fut.get("l") or []
-                    c_list = d_fut.get("c") or []
-                    v_list = d_fut.get("v") or []
-                    if t_list:
-                        min_srv_dt = _from_ts_tw(min(int(x) for x in t_list))
-                        with self.lock:
-                            # 清除該區間內可能被舊版 UTC+0 污染的 K 棒，重新寫入純台灣時間 (UTC+8) K 棒
-                            stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt]
-                            for sk in stale_keys:
-                                self.kbars_1m.pop(sk, None)
-                            for i, ts_val in enumerate(t_list):
-                                c_v = float(c_list[i] or 0.0)
-                                if c_v <= 0:
-                                    continue
-                                dt = _from_ts_tw(ts_val)
-                                self.kbars_1m[dt] = {
-                                    "timestamp": dt,
-                                    "open": float(o_list[i] or c_v),
-                                    "high": float(h_list[i] or c_v),
-                                    "low": float(l_list[i] or c_v),
-                                    "close": c_v,
-                                    "volume": max(1, int(float(v_list[i] or 1))),
-                                }
-                                added += 1
-                                pulled_live += 1
-                            source_name = "台指期連續夜日盤分K伺服器"
-                except Exception:
-                    pass
+                need_night_backfill = True
+                with self.lock:
+                    if len(self.kbars_1m) >= 400:
+                        last_dt_fut = max(self.kbars_1m.keys())
+                        if last_dt_fut.date() == today_date and symbol in self._last_server_pull_dt:
+                            need_night_backfill = False
+
+                if need_night_backfill:
+                    cnyes_fut = "TWF:TXF:FUTURES"
+                    try:
+                        r_fut = requests.get(
+                            f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
+                            headers=headers,
+                            timeout=4,
+                        )
+                        d_fut = (r_fut.json().get("data") or {})
+                        t_list = d_fut.get("t") or []
+                        o_list = d_fut.get("o") or []
+                        h_list = d_fut.get("h") or []
+                        l_list = d_fut.get("l") or []
+                        c_list = d_fut.get("c") or []
+                        v_list = d_fut.get("v") or []
+                        if t_list:
+                            min_srv_dt = _from_ts_tw(min(int(x) for x in t_list))
+                            with self.lock:
+                                # 清除該區間內可能被舊版 UTC+0 污染的 K 棒，重新寫入純台灣時間 (UTC+8) K 棒
+                                stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt]
+                                for sk in stale_keys:
+                                    self.kbars_1m.pop(sk, None)
+                                for i, ts_val in enumerate(t_list):
+                                    c_v = float(c_list[i] or 0.0)
+                                    if c_v <= 0:
+                                        continue
+                                    dt = _from_ts_tw(ts_val)
+                                    self.kbars_1m[dt] = {
+                                        "timestamp": dt,
+                                        "open": float(o_list[i] or c_v),
+                                        "high": float(h_list[i] or c_v),
+                                        "low": float(l_list[i] or c_v),
+                                        "close": c_v,
+                                        "volume": max(1, int(float(v_list[i] or 1))),
+                                    }
+                                    added += 1
+                                    pulled_live += 1
+                                source_name = "台指期連續夜日盤分K伺服器"
+                    except Exception:
+                        pass
 
                 # 再從台灣期貨交易所官網 API (mis.taifex.com.tw) 取得該契約 0 秒延遲精準報價與當日 1m K 棒
                 cid = "TMF" if "TMF" in symbol else ("MXF" if ("MTX" in symbol or "MXF" in symbol) else "TXF")
