@@ -24,7 +24,8 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 10
+    VERSION = 11
+    _last_sync_ts: Dict[str, float] = {}
 
     def __init__(self, store_dir: Optional[str | Path] = "data", auto_load_store: bool = False):
         self.sol_d = None
@@ -570,7 +571,10 @@ class TaishinQuoteFeed:
                 if last_dt.date() < now.date() or (now - last_dt).total_seconds() > 90:
                     is_stale = True
 
-        if is_stale:
+        now_ts = time.time()
+        last_sync = self._last_sync_ts.get(symbol, 0.0)
+        if is_stale and (now_ts - last_sync >= 20.0):
+            self._last_sync_ts[symbol] = now_ts
             self._sync_realtime_kbars_and_quote(symbol)
         if not self.connected and (user_id or self.current_user_id) and (password or self.current_password):
             self.start(user_id or self.current_user_id, password or self.current_password, symbol)

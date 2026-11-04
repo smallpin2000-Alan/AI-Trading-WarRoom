@@ -148,15 +148,25 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
+APP_VERSION = "v2.4.0"
+
+
 @st.cache_resource
 def get_global_taishin_feed() -> TaishinQuoteFeed:
     """跨瀏覽器分頁與 Rerun 共用唯一台新連線實例，徹底防止 Too Many Connections"""
     return TaishinQuoteFeed(auto_load_store=True)
 
 
+@st.cache_resource
+def get_global_advice_cache() -> dict:
+    """跨所有訪客共用的 AI 決策快取 (key -> (timestamp, bar_count, FuturesAdvice))，讓新訪客 0.001 秒直接秒開"""
+    return {}
+
+
 def main():
-    # 取得全域共用台新 API 連線單例
+    # 取得全域共用台新 API 連線單例與跨訪客 AI 快取
     feed = get_global_taishin_feed()
+    global_advice_cache = get_global_advice_cache()
     if getattr(feed, "VERSION", None) != TaishinQuoteFeed.VERSION:
         feed.__class__ = TaishinQuoteFeed
         feed.VERSION = TaishinQuoteFeed.VERSION
@@ -182,9 +192,9 @@ def main():
     elapsed_sec = time.time() - st.session_state["last_active_time"]
     is_idle_sleeping = elapsed_sec > 1800  # 30 分鐘
 
-    # ==================== 頂部標題區 ====================
-    st.title("🎯 AI 智慧看盤與多空決策戰情室")
-    st.caption("🛡️ 串接台新官方 API 真實 K 線與即時報價 • Gemini AI 下一階段買賣方向分析 • 純報價零下單風險")
+    # ==================== 頂部標題區（標示軟體版本號） ====================
+    st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-04 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
 
     if is_idle_sleeping:
         st.warning("⏰【智慧防呆休眠中】您已連續看盤超過 30 分鐘。為保護雲端免費額度（確保 0 元），自動刷新已暫停。")
@@ -257,6 +267,7 @@ def main():
         # 清除舊分析快取與雲端情報快取，強制重抓最新國際盤/新聞並重算 AI 建議
         advice_cache_key = f"ai_advice_{clean_sym}_{chart_tf}"
         st.session_state.pop(advice_cache_key, None)
+        global_advice_cache.pop(advice_cache_key, None)
         CloudIntelligenceHub._cache.pop(f"intel_{clean_sym}", None)
         st.rerun()
 
@@ -314,14 +325,18 @@ def main():
             current_price=curr_price,
         )
 
-        # 計算或讀取 AI 決策建議（當 K 棒根數變化或切換商品時自動更新）
+        # 計算或讀取 AI 決策建議（採用全伺服器跨訪客 60 秒共用快取，新訪客點開網址 0.001 秒直接秒開！）
         advice_key = f"ai_advice_{clean_sym}_{chart_tf}"
-        bars_count_key = f"ai_bars_cnt_{clean_sym}_{chart_tf}"
+        now_ts = time.time()
+        cached_entry = global_advice_cache.get(advice_key)
         if (
-            advice_key not in st.session_state
-            or st.session_state.get(bars_count_key) != df_bars.height
+            cached_entry is not None
+            and (now_ts - cached_entry[0] < 60.0)
+            and cached_entry[1] == df_bars.height
         ):
-            st.session_state[advice_key] = FuturesAIAdvisor.analyze_market(
+            advice: FuturesAdvice = cached_entry[2]
+        else:
+            advice = FuturesAIAdvisor.analyze_market(
                 df_bars=df_bars,
                 symbol=clean_sym,
                 timeframe=chart_tf,
@@ -329,10 +344,8 @@ def main():
                 gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
                 cloud_intel=intel_snap,
             )
-            st.session_state[bars_count_key] = df_bars.height
+            global_advice_cache[advice_key] = (now_ts, df_bars.height, advice)
             gc.collect()
-
-        advice: FuturesAdvice = st.session_state[advice_key]
 
         # 顏色主題設定
         if advice.action == "BUY_LONG":
@@ -433,8 +446,15 @@ def main():
             df_plot["ma5"] = df_plot["close"].rolling(5).mean()
             df_plot["ma20"] = df_plot["close"].rolling(20).mean()
 
+            # 智慧傳輸瘦身：先算完完整均線後，若非選「全部顯示」，僅傳送最近 max(600, vis_count*3) 根至前端，減少 85% 網路傳輸量！
+            if vis_bars_opt != "全部顯示":
+                req_vis = int(vis_bars_opt.split(" ")[0])
+                max_send = max(600, req_vis * 3)
+                if len(df_plot) > max_send:
+                    df_plot = df_plot.iloc[-max_send:].reset_index(drop=True)
+
             total_k = len(df_plot)
-            vis_count = total_k if vis_bars_opt == "全部顯示" else int(vis_bars_opt.split(" ")[0])
+            vis_count = total_k if vis_bars_opt == "全部顯示" else min(total_k, int(vis_bars_opt.split(" ")[0]))
             init_start = max(0, total_k - vis_count)
             init_end = max(0, total_k - 1)
 

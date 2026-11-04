@@ -1,6 +1,8 @@
 # src/data/kbar_store.py
 from __future__ import annotations
 import os
+import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
@@ -11,10 +13,11 @@ class KBarStore:
     """
     台新 API 歷史與即時 K 線本地與 Google Cloud Storage 持久化儲存層 (Parquet Storage)
     - 僅儲存來自台新官方 API 的真實 1 分鐘 K 棒。
-    - 支援啟動時毫秒級預載入，並於收到台新新 K 棒時自動去重合併存檔與雲端同步。
+    - 支援啟動時毫秒級預載入，並於收到台新新 K 棒時自動去重合併存檔與背景非阻塞雲端同步。
     """
 
     DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "point-api-512405-stock-history").strip()
+    _last_gcs_upload_ts: Dict[str, float] = {}
 
     def __init__(self, data_dir: str | Path = "data"):
         self.data_dir = Path(data_dir)
@@ -46,16 +49,26 @@ class KBarStore:
         )
         df.write_parquet(file_path)
 
-        # 若在 Cloud Run 雲端環境，將最新台新 K 線同步上傳至 GCS 永久保存
-        if (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and self.DEFAULT_GCS_BUCKET:
-            try:
-                from google.cloud import storage
-                client = storage.Client()
-                bucket = client.bucket(self.DEFAULT_GCS_BUCKET)
-                blob = bucket.blob(f"kbars/{file_path.name}")
-                blob.upload_from_filename(str(file_path))
-            except Exception:
-                pass
+        # 若在 Cloud Run 雲端環境，於背景執行緒非阻塞上傳至 GCS 永久保存（每檔至少間隔 120 秒，絕不卡住前端網頁）
+        now_ts = time.time()
+        last_up = self._last_gcs_upload_ts.get(file_path.name, 0.0)
+        if (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and self.DEFAULT_GCS_BUCKET and (now_ts - last_up >= 120.0):
+            self._last_gcs_upload_ts[file_path.name] = now_ts
+            bucket_name = self.DEFAULT_GCS_BUCKET
+            local_str = str(file_path)
+            blob_name = f"kbars/{file_path.name}"
+
+            def _bg_upload():
+                try:
+                    from google.cloud import storage
+                    client = storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    blob = bucket.blob(blob_name)
+                    blob.upload_from_filename(local_str)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_bg_upload, daemon=True).start()
 
         return len(sorted_bars)
 

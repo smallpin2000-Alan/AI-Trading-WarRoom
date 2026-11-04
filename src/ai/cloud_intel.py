@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import json
 import time
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -95,9 +97,6 @@ class CloudIntelligenceHub:
         if cache_key in cls._cache:
             cached_time, cached_snap = cls._cache[cache_key]
             if now_ts - cached_time < cls.CACHE_TTL_SEC:
-                # 即使使用快取，若有新價格仍即時更新預測驗證勝率
-                if current_price > 0:
-                    cls._update_and_evaluate_predictions(clean_sym, current_price, cached_snap)
                 return cached_snap
 
         snap = CloudIntelSnapshot(
@@ -105,14 +104,16 @@ class CloudIntelligenceHub:
             fetched_at=time.strftime("%H:%M:%S"),
         )
 
-        # 1. 抓取全球跨市場連動指標
-        cls._populate_global_quotes(snap)
-
-        # 2. 抓取 Google News 即時財經新聞
-        cls._populate_realtime_news(snap, clean_sym, symbol_label)
-
-        # 3. 讀取 Google Cloud Storage / 本地共享之盤前推薦與覆盤籌碼資料
-        cls._populate_gcs_institutional(snap, clean_sym)
+        # 多執行緒同時平行抓取：1. 國際跨市場指標 + 2. Google News 即時新聞 + 3. GCS 法人籌碼
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f1 = pool.submit(cls._populate_global_quotes, snap)
+            f2 = pool.submit(cls._populate_realtime_news, snap, clean_sym, symbol_label)
+            f3 = pool.submit(cls._populate_gcs_institutional, snap, clean_sym)
+            for fut in (f1, f2, f3):
+                try:
+                    fut.result(timeout=4.5)
+                except Exception:
+                    pass
 
         # 4. 評估 AI 歷史預測準確率
         if current_price > 0:
@@ -130,11 +131,12 @@ class CloudIntelligenceHub:
         bull_pts = 0
         bear_pts = 0
 
-        for ticker, name in cls.GLOBAL_TARGETS:
+        def _fetch_one(item: tuple[str, str]) -> Optional[GlobalQuoteItem]:
+            ticker, name = item
             try:
                 encoded = urllib.parse.quote(ticker)
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1d&range=2d"
-                resp = requests.get(url, headers=headers, timeout=3.5)
+                resp = requests.get(url, headers=headers, timeout=2.8)
                 if resp.status_code == 200:
                     meta = resp.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
                     price = float(meta.get("regularMarketPrice") or 0.0)
@@ -142,25 +144,34 @@ class CloudIntelligenceHub:
                     if price > 0 and prev > 0:
                         pct = ((price - prev) / prev) * 100.0
                         icon = "🔺" if pct > 0.05 else ("🔻" if pct < -0.05 else "➖")
-                        quotes.append(GlobalQuoteItem(
+                        return GlobalQuoteItem(
                             symbol=ticker,
                             name=name,
                             price=price,
                             change_pct=round(pct, 2),
                             status_icon=icon,
-                        ))
-                        if ticker in ("NQ=F", "TSM", "^SOX"):
-                            if pct >= 0.35:
-                                bull_pts += 1
-                            elif pct <= -0.35:
-                                bear_pts += 1
-                        elif ticker == "^VIX":
-                            if pct >= 5.0:
-                                bear_pts += 1
-                            elif pct <= -3.0:
-                                bull_pts += 1
+                        )
             except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            results = list(ex.map(_fetch_one, cls.GLOBAL_TARGETS))
+
+        for q in results:
+            if q is None:
                 continue
+            quotes.append(q)
+            if q.symbol in ("NQ=F", "TSM", "^SOX"):
+                if q.change_pct >= 0.35:
+                    bull_pts += 1
+                elif q.change_pct <= -0.35:
+                    bear_pts += 1
+            elif q.symbol == "^VIX":
+                if q.change_pct >= 5.0:
+                    bear_pts += 1
+                elif q.change_pct <= -3.0:
+                    bull_pts += 1
 
         snap.global_quotes = quotes
         if quotes:
@@ -405,18 +416,24 @@ class CloudIntelligenceHub:
                 json.dumps(records, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            # 若在 Cloud Run 環境，同步備份至 Google Cloud Storage
+            # 若在 Cloud Run 環境，於背景執行緒非阻塞備份至 Google Cloud Storage
             if (os.getenv("K_SERVICE") or os.getenv("GCS_BUCKET")) and cls.DEFAULT_GCS_BUCKET:
-                try:
-                    from google.cloud import storage
-                    client = storage.Client()
-                    bucket = client.bucket(cls.DEFAULT_GCS_BUCKET)
-                    blob = bucket.blob("history/ai_predictions_log.json")
-                    blob.upload_from_string(
-                        json.dumps({"records": records}, ensure_ascii=False, indent=2),
-                        content_type="application/json; charset=utf-8",
-                    )
-                except Exception:
-                    pass
+                bucket_name = cls.DEFAULT_GCS_BUCKET
+                payload_str = json.dumps({"records": records}, ensure_ascii=False, indent=2)
+
+                def _bg_save_pred():
+                    try:
+                        from google.cloud import storage
+                        client = storage.Client()
+                        bucket = client.bucket(bucket_name)
+                        blob = bucket.blob("history/ai_predictions_log.json")
+                        blob.upload_from_string(
+                            payload_str,
+                            content_type="application/json; charset=utf-8",
+                        )
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_bg_save_pred, daemon=True).start()
         except Exception:
             pass
