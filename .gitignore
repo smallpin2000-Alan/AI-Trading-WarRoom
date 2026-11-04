@@ -12,6 +12,7 @@ Configs/
 # Credentials (never commit)
 config/taishin_config.json
 .env
+env.yaml
 
 # Google Drive shortcut pointers
 *.gdoc

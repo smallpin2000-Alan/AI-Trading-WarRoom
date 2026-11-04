@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+logs
+solace*.log*
+SolPY.log
+env.yaml
+.env
+config/taishin_config.json

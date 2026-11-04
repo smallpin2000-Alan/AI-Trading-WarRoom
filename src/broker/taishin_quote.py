@@ -231,30 +231,115 @@ class TaishinQuoteFeed:
             if len(self.raw_ticks) > 5000:
                 self.raw_ticks.pop(0)
 
-            # 若已有台新 K 棒快取，同步將即時 Tick 聚合進對應的 1m K 棒
-            if self.kbars_1m:
-                bar_dt = tick.timestamp.replace(second=0, microsecond=0)
-                if bar_dt in self.kbars_1m:
-                    b = self.kbars_1m[bar_dt]
-                    b["high"] = max(b["high"], float(tick.price))
-                    b["low"] = min(b["low"], float(tick.price))
-                    b["close"] = float(tick.price)
-                    b["volume"] = int(b["volume"]) + int(tick.volume)
-                else:
-                    self.kbars_1m[bar_dt] = {
-                        "timestamp": bar_dt,
-                        "open": float(tick.price),
-                        "high": float(tick.price),
-                        "low": float(tick.price),
-                        "close": float(tick.price),
-                        "volume": max(1, int(tick.volume)),
-                    }
+            # 同步將即時 Tick 聚合進對應的 1m K 棒 (零延遲即時成棒)
+            bar_dt = tick.timestamp.replace(second=0, microsecond=0)
+            if bar_dt in self.kbars_1m:
+                b = self.kbars_1m[bar_dt]
+                b["high"] = max(b["high"], float(tick.price))
+                b["low"] = min(b["low"], float(tick.price))
+                b["close"] = float(tick.price)
+                b["volume"] = int(b["volume"]) + int(tick.volume)
+            else:
+                self.kbars_1m[bar_dt] = {
+                    "timestamp": bar_dt,
+                    "open": float(tick.price),
+                    "high": float(tick.price),
+                    "low": float(tick.price),
+                    "close": float(tick.price),
+                    "volume": max(1, int(tick.volume)),
+                }
 
         for cb in self.on_tick_callbacks:
             try:
                 cb(tick)
             except Exception as ex:
                 print(f"TaishinQuoteFeed: 外部回呼例外: {ex}")
+
+    def _fetch_solace_kbars_via_sol_d(self, symbol: str, lookback_days: int = 15) -> int:
+        """
+        透過純 Python Sol_D 底層 Solace 通道直接向台新伺服器請求 1m K 棒 (His_RTADV/S/{symbol}/K/1)
+        - 完全不依賴 Windows .NET DLL，可在 Linux (Cloud Run) 與 Windows 雙平台零延遲運作。
+        """
+        if not self.sol_d:
+            return 0
+        try:
+            sol_client = getattr(self.sol_d, "_Sol_D__solace", None)
+            api = getattr(sol_client, "_api", None) if sol_client else None
+            if not api or not getattr(api, "_message_requester", None):
+                return 0
+
+            from solace.messaging.resources.topic import Topic
+
+            begin_dt = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y%m%d")
+            end_dt = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y%m%d")
+            payload_bytes = bytearray(f"{begin_dt},{end_dt}", "utf-8")
+
+            mkt = "S" if symbol.isdigit() else "SF"
+            topic_str = f"His_RTADV/{mkt}/{symbol}/K/1"
+            req_msg = api._message_service.message_builder().build(payload=payload_bytes)
+            resp = api._message_requester.publish_await_response(
+                request_message=req_msg,
+                request_destination=Topic.of(topic_str),
+                reply_timeout=4000,
+            )
+            if not resp:
+                return 0
+            raw_bytes = resp.get_payload_as_bytes()
+            if not raw_bytes:
+                return 0
+            txt = raw_bytes.decode("utf-8", errors="ignore").strip()
+            if not txt:
+                return 0
+
+            count = 0
+            with self.lock:
+                for rec in txt.split("|"):
+                    rec = rec.strip()
+                    if not rec:
+                        continue
+                    cols = rec.split(",")
+                    if len(cols) < 9:
+                        continue
+                    date_str = cols[0].strip()
+                    t_raw = int(float(cols[2].strip() or 0))
+                    # 若為 5~6 位數 (HHMMSS)，轉為 HHMM
+                    t_hhmm = t_raw // 100 if t_raw >= 2400 else t_raw
+                    dt = self._parse_kbar_datetime(date_str, t_hhmm)
+                    if dt is None:
+                        continue
+                    o_p = float(cols[5] or 0.0)
+                    h_p = float(cols[6] or 0.0)
+                    l_p = float(cols[7] or 0.0)
+                    c_p = float(cols[8] or 0.0)
+                    if c_p <= 0:
+                        continue
+                    qty = int(float(cols[3] or 0))
+                    self.kbars_1m[dt] = {
+                        "timestamp": dt,
+                        "open": o_p,
+                        "high": h_p,
+                        "low": l_p,
+                        "close": c_p,
+                        "volume": max(1, qty),
+                    }
+                    count += 1
+
+                if count > 0 and self.kbars_1m:
+                    last_dt = max(self.kbars_1m.keys())
+                    last_b = self.kbars_1m[last_dt]
+                    self.latest_tick = TickData(
+                        timestamp=last_dt,
+                        price=float(last_b["close"]),
+                        volume=int(last_b["volume"]),
+                    )
+                    if self.store:
+                        self.store.save_kbars(symbol, self.kbars_1m)
+                    self.ta_rcv_done = True
+                    self.status_msg = f"🟢 已載入完成 ({symbol}: 共 {len(self.kbars_1m)} 根 K 棒)"
+            return count
+        except Exception as ex:
+            print(f"TaishinQuoteFeed: Solace His_RTADV K 棒請求略過 ({symbol}): {ex}")
+            return 0
 
     def switch_symbol(self, symbol: str, user_id: str = "", password: str = "", lookback_days: int = 15):
         """
@@ -360,6 +445,8 @@ class TaishinQuoteFeed:
             try:
                 new_exch = "TWS" if symbol.isdigit() else "TWF"
                 self.sol_d.Subscribe(new_exch, symbol)
+                if not self.ta_connected:
+                    self._fetch_solace_kbars_via_sol_d(symbol, lookback_days=lookback_days)
             except Exception as ex:
                 print(f"TaishinQuoteFeed: switch_symbol Sol_D 例外: {ex}")
 
@@ -483,8 +570,10 @@ class TaishinQuoteFeed:
                     is_stock = target_sym.isdigit()
                     exch = "TWS" if is_stock else "TWF"
                     sub_rc = self.sol_d.Subscribe(exch, target_sym)
+                    if not self.ta_connected or not self.kbars_1m:
+                        self._fetch_solace_kbars_via_sol_d(target_sym, lookback_days=lookback_days)
                     if sub_rc == RCode.OK:
-                        self.status_msg = f"🟢 已連線 (台新 K 線與即時報價: {target_sym})"
+                        self.status_msg = f"🟢 已連線 (台新零延遲 K 線與即時報價: {target_sym})"
                     else:
                         if not self.ta_connected:
                             self.status_msg = f"連線成功但訂閱回傳: {sub_rc}"
