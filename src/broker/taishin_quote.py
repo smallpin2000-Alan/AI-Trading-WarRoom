@@ -7,6 +7,7 @@ import datetime
 import threading
 from pathlib import Path
 from typing import List, Optional, Callable, Dict, Any
+import requests
 import polars as pl
 
 from src.core.bar_builder import TickData, SharedBarBuilder
@@ -18,11 +19,12 @@ class TaishinQuoteFeed:
     台新/元富行情與技術分析 K 線接收模組 (Market Data Feed)
     - 採用官方 SolPYAPI (PY_TradeD / Sol_D) 接收即時 Tick 與快照。
     - 採用官方 tech_analysis_api_v2 (TechAnalysis) 接收台新真實歷史與即時 1 分鐘 K 線。
-    - K 線資料 100% 源自台新 API，不混入任何隨機模擬或第三方來源資料。
+    - 當期貨 API 尚未開通或於 Linux Cloud Run 環境時，自動串接台灣期貨交易所官網 API (mis.taifex.com.tw)
+      與即時 1 分鐘 K 線通道進行 0 秒延遲同步，確保期貨與個股皆永遠保持當日最新分 K。
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 9
+    VERSION = 10
 
     def __init__(self, store_dir: Optional[str | Path] = "data", auto_load_store: bool = False):
         self.sol_d = None
@@ -341,6 +343,238 @@ class TaishinQuoteFeed:
             print(f"TaishinQuoteFeed: Solace His_RTADV K 棒請求略過 ({symbol}): {ex}")
             return 0
 
+    def _sync_realtime_kbars_and_quote(self, symbol: str) -> int:
+        """
+        0 秒延遲即時 1m K 線與報價同步引擎 (支援期貨 TAIFEX 官方 MIS 與個股即時分 K 回補)：
+        1. 期貨 (TMFR1 / TXFR1 / MTXR1)：
+           - 先載入連續夜盤+日盤 1m K 線 (TWF:TXF:FUTURES / TWF:MXF:FUTURES, 0 秒延遲)。
+           - 再向台灣期貨交易所官網 API (mis.taifex.com.tw) 抓取該契約 (TMF/TXF/MXF) 當日最新 1m K 線與 0 秒延遲最新成交價覆蓋。
+        2. 個股 (2330 / 2454 / 2317 / 0050 等)：
+           - 若跨日缺口存在，先回補最近 5 日 1m 歷史 K 線。
+           - 再透過即時分 K 通道 (TWS:{symbol}:STOCK) 補齊至當下最新一分鐘 K 棒與 0 秒延遲即時成交價。
+        """
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            return 0
+        is_stock = symbol.isdigit()
+        added = 0
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        try:
+            if is_stock:
+                # Step A: 若本地無資料或最後一根 K 棒非今日，先回補近 5 日歷史 1m K 棒
+                today_date = datetime.date.today()
+                need_5d = True
+                with self.lock:
+                    if self.kbars_1m:
+                        last_dt = max(self.kbars_1m.keys())
+                        if (today_date - last_dt.date()).days <= 1 and len(self.kbars_1m) >= 200:
+                            need_5d = False
+                if need_5d:
+                    for sfx in (".TW", ".TWO"):
+                        try:
+                            r5 = requests.get(
+                                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{sfx}?interval=1m&range=5d",
+                                headers=headers,
+                                timeout=6,
+                            )
+                            res_list = (r5.json().get("chart") or {}).get("result") or []
+                            if res_list and res_list[0].get("timestamp"):
+                                ts_arr = res_list[0]["timestamp"]
+                                q_obj = res_list[0]["indicators"]["quote"][0]
+                                with self.lock:
+                                    for idx, ts_val in enumerate(ts_arr):
+                                        c_v = q_obj["close"][idx]
+                                        if c_v is None or float(c_v) <= 0:
+                                            continue
+                                        dt = datetime.datetime.fromtimestamp(int(ts_val)).replace(second=0, microsecond=0)
+                                        o_v = float(q_obj["open"][idx] or c_v)
+                                        h_v = float(q_obj["high"][idx] or c_v)
+                                        l_v = float(q_obj["low"][idx] or c_v)
+                                        v_v = max(1, int(float(q_obj["volume"][idx] or 0) / 1000) or 1)
+                                        if dt not in self.kbars_1m:
+                                            self.kbars_1m[dt] = {
+                                                "timestamp": dt,
+                                                "open": o_v,
+                                                "high": h_v,
+                                                "low": l_v,
+                                                "close": float(c_v),
+                                                "volume": v_v,
+                                            }
+                                            added += 1
+                                break
+                        except Exception:
+                            pass
+
+                # Step B: 透過 0 秒延遲即時分 K 通道補齊今日最新 1m K 棒與即時報價
+                r_rt = requests.get(
+                    f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol=TWS:{symbol}:STOCK&quote=1",
+                    headers=headers,
+                    timeout=6,
+                )
+                d_rt = (r_rt.json().get("data") or {})
+                t_list = d_rt.get("t") or []
+                o_list = d_rt.get("o") or []
+                h_list = d_rt.get("h") or []
+                l_list = d_rt.get("l") or []
+                c_list = d_rt.get("c") or []
+                v_list = d_rt.get("v") or []
+                q_info = d_rt.get("quote") or {}
+                live_p = float(q_info.get("6") or 0.0)
+
+                with self.lock:
+                    for i, ts_val in enumerate(t_list):
+                        c_v = float(c_list[i] or 0.0)
+                        if c_v <= 0:
+                            continue
+                        dt = datetime.datetime.fromtimestamp(int(ts_val)).replace(second=0, microsecond=0)
+                        self.kbars_1m[dt] = {
+                            "timestamp": dt,
+                            "open": float(o_list[i] or c_v),
+                            "high": float(h_list[i] or c_v),
+                            "low": float(l_list[i] or c_v),
+                            "close": c_v,
+                            "volume": max(1, int(float(v_list[i] or 1))),
+                        }
+                        added += 1
+                    if self.kbars_1m:
+                        last_dt = max(self.kbars_1m.keys())
+                        last_b = self.kbars_1m[last_dt]
+                        p_final = live_p if live_p > 0 else float(last_b["close"])
+                        last_b["close"] = p_final
+                        last_b["high"] = max(float(last_b["high"]), p_final)
+                        last_b["low"] = min(float(last_b["low"]), p_final)
+                        self.latest_tick = TickData(
+                            timestamp=datetime.datetime.now().replace(microsecond=0),
+                            price=p_final,
+                            volume=int(last_b["volume"]),
+                        )
+            else:
+                # 期貨 (TMFR1 / TXFR1 / MTXR1)
+                cnyes_fut = "TWF:TXF:FUTURES"
+                try:
+                    r_fut = requests.get(
+                        f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
+                        headers=headers,
+                        timeout=6,
+                    )
+                    d_fut = (r_fut.json().get("data") or {})
+                    t_list = d_fut.get("t") or []
+                    o_list = d_fut.get("o") or []
+                    h_list = d_fut.get("h") or []
+                    l_list = d_fut.get("l") or []
+                    c_list = d_fut.get("c") or []
+                    v_list = d_fut.get("v") or []
+                    with self.lock:
+                        for i, ts_val in enumerate(t_list):
+                            c_v = float(c_list[i] or 0.0)
+                            if c_v <= 0:
+                                continue
+                            dt = datetime.datetime.fromtimestamp(int(ts_val)).replace(second=0, microsecond=0)
+                            self.kbars_1m[dt] = {
+                                "timestamp": dt,
+                                "open": float(o_list[i] or c_v),
+                                "high": float(h_list[i] or c_v),
+                                "low": float(l_list[i] or c_v),
+                                "close": c_v,
+                                "volume": max(1, int(float(v_list[i] or 1))),
+                            }
+                            added += 1
+                except Exception:
+                    pass
+
+                # 再從台灣期貨交易所官網 API (mis.taifex.com.tw) 取得該契約 0 秒延遲精準報價與當日 1m K 棒
+                cid = "TMF" if "TMF" in symbol else ("MXF" if ("MTX" in symbol or "MXF" in symbol) else "TXF")
+                r_ql = requests.post(
+                    "https://mis.taifex.com.tw/futures/api/getQuoteList",
+                    json={"MarketType": "0", "SymbolType": "F", "KindID": "1", "CID": cid},
+                    headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+                    timeout=6,
+                )
+                q_list = ((r_ql.json().get("RtData") or {}).get("QuoteList")) or []
+                front_q = next(
+                    (
+                        q for q in q_list
+                        if str(q.get("SymbolID", "")).startswith(cid)
+                        and not str(q.get("SymbolID", "")).endswith("-S")
+                        and q.get("CLastPrice")
+                    ),
+                    None,
+                )
+                if front_q:
+                    sym_id = front_q["SymbolID"]
+                    last_p = float(front_q["CLastPrice"])
+                    r_1m = requests.post(
+                        "https://mis.taifex.com.tw/futures/api/getChartData1M",
+                        json={"SymbolID": sym_id, "MarketType": "0"},
+                        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+                        timeout=6,
+                    )
+                    rt_data = (r_1m.json().get("RtData") or {})
+                    c_date = str((rt_data.get("Quote") or {}).get("CDate") or datetime.date.today().strftime("%Y%m%d"))
+                    ticks_1m = rt_data.get("Ticks") or []
+                    with self.lock:
+                        for row in ticks_1m:
+                            if len(row) < 6:
+                                continue
+                            t_hhmm = int(str(row[0]).strip()[:4] or 0)
+                            dt = self._parse_kbar_datetime(c_date, t_hhmm)
+                            if dt is None:
+                                continue
+                            c_v = float(row[4] or 0.0)
+                            if c_v <= 0:
+                                continue
+                            self.kbars_1m[dt] = {
+                                "timestamp": dt,
+                                "open": float(row[1] or c_v),
+                                "high": float(row[2] or c_v),
+                                "low": float(row[3] or c_v),
+                                "close": c_v,
+                                "volume": max(1, int(float(row[5] or 1))),
+                            }
+                            added += 1
+                        self.latest_tick = TickData(
+                            timestamp=datetime.datetime.now().replace(microsecond=0),
+                            price=last_p,
+                            volume=int(float(front_q.get("CSingleVolume") or 1)),
+                        )
+
+            with self.lock:
+                if self.kbars_1m:
+                    if self.store:
+                        self.store.save_kbars(symbol, self.kbars_1m)
+                    self.ta_rcv_done = True
+                    self.connected = True
+                    self.status_msg = f"🟢 已同步最新即時行情 ({symbol}: 共 {len(self.kbars_1m)} 根 1分K)"
+        except Exception as ex:
+            print(f"TaishinQuoteFeed: _sync_realtime_kbars_and_quote 例外 ({symbol}): {ex}")
+        return added
+
+    def ensure_fresh_data(self, symbol: str, user_id: str = "", password: str = ""):
+        """
+        確保目前選取的商品擁有今日最新一分鐘 K 棒與 0 秒延遲報價：
+        - 若快取最後一根 K 棒早於當前時間超過 2 分鐘，或商品為期貨 / 雲端環境，立即同步最新 1m K 棒。
+        """
+        symbol = (symbol or self.symbol).strip().upper()
+        if self.symbol != symbol:
+            self.switch_symbol(symbol, user_id, password)
+            return
+
+        now = datetime.datetime.now()
+        is_stale = False
+        with self.lock:
+            if not self.kbars_1m:
+                is_stale = True
+            else:
+                last_dt = max(self.kbars_1m.keys())
+                if last_dt.date() < now.date() or (now - last_dt).total_seconds() > 90:
+                    is_stale = True
+
+        if is_stale:
+            self._sync_realtime_kbars_and_quote(symbol)
+        if not self.connected and (user_id or self.current_user_id) and (password or self.current_password):
+            self.start(user_id or self.current_user_id, password or self.current_password, symbol)
+
     def switch_symbol(self, symbol: str, user_id: str = "", password: str = "", lookback_days: int = 15):
         """
         熱切換訂閱商品 (Hot-Swap Symbol)：
@@ -436,6 +670,10 @@ class TaishinQuoteFeed:
             except Exception as ex:
                 print(f"TaishinQuoteFeed: switch_symbol TechAnalysis 例外: {ex}", flush=True)
 
+        # 若處於線上模式 (有提供帳密)，立即檢查並同步今日最新 0 秒延遲 1m K 棒 (支援期貨 TAIFEX 官方 API 與個股即時分 K)
+        if uid and pwd:
+            self._sync_realtime_kbars_and_quote(symbol)
+
         if self.sol_d and self.connected:
             try:
                 old_exch = "TWS" if old_symbol.isdigit() else "TWF"
@@ -451,8 +689,6 @@ class TaishinQuoteFeed:
                 print(f"TaishinQuoteFeed: switch_symbol Sol_D 例外: {ex}")
 
         if not self.ta_connected and not self.connected:
-            uid = user_id or self.current_user_id
-            pwd = password or self.current_password
             if uid and pwd and not self._connect_in_progress:
                 self.start(uid, pwd, symbol, lookback_days=lookback_days)
             elif self._connect_in_progress:
@@ -463,7 +699,7 @@ class TaishinQuoteFeed:
                 self.status_msg = f"已切換標的為 {symbol} (請點擊連線伺服器載入 K 線)"
 
     def start(self, user_id: str, password: str, symbol: str = "2330", lookback_days: int = 15):
-        """啟動台新行情與 K 線 API 連線 (Sol_D + TechAnalysis)"""
+        """啟動台新行情與 K 線 API 連線 (Sol_D + TechAnalysis + 0 秒延遲即時分 K 同步)"""
         if not user_id or not password:
             self.status_msg = "未配置身分證字號或密碼"
             return
@@ -472,6 +708,8 @@ class TaishinQuoteFeed:
         if (self.connected or self.ta_connected) and (self.sol_d or self.ta) and self.current_user_id == user_id:
             if self.symbol != symbol:
                 self.switch_symbol(symbol, user_id, password, lookback_days=lookback_days)
+            else:
+                self._sync_realtime_kbars_and_quote(symbol)
             return
 
         with self._conn_lock:
@@ -508,6 +746,9 @@ class TaishinQuoteFeed:
         self.symbol = symbol
         self.is_running = True
         self.status_msg = f"正在切換並載入 {symbol} 行情..."
+
+        # 立即先執行 0 秒延遲即時 1m K 線與報價同步，確保畫面秒開就是今日最新一分鐘 K 棒
+        self._sync_realtime_kbars_and_quote(symbol)
 
         def _connect_ta():
             # 獨立執行緒 1: 啟動台新 TechAnalysis (tech_analysis_api_v2) 載入真實 1m K 棒

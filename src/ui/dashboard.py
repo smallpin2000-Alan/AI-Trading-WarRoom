@@ -170,11 +170,10 @@ def main():
     actual_user = default_cfg.get("sol_user_id", "")
     ts_pwd = default_cfg.get("sol_password", "")
 
-    # 首次啟動自動背景連線
+    # 首次啟動自動背景連線與當日最新 1m K 線補齊 (移除舊快取存在就不連線的限制)
     if not st.session_state.get("auto_connect_attempted", False):
         st.session_state["auto_connect_attempted"] = True
-        if actual_user and ts_pwd and not feed.connected and not feed.is_running and len(feed.kbars_1m) == 0:
-            feed.start(actual_user, ts_pwd, "2330")
+        feed.ensure_fresh_data(feed.symbol, actual_user, ts_pwd)
 
     # 30 分鐘自動防呆休眠計時器 (避免忘記關網頁耗費雲端資源，確保 100% 0 元)
     if "last_active_time" not in st.session_state:
@@ -251,13 +250,10 @@ def main():
     # 手動點擊「連線 / 重新 AI 分析」按鈕
     if manual_trigger:
         st.session_state["last_active_time"] = time.time()
-        if not feed.connected:
-            with st.spinner(f"正在連線台新行情伺服器並載入 {ts_symbol} K 線..."):
+        with st.spinner(f"正在同步 {ts_symbol} 今日最新 0 秒延遲 K 線與報價..."):
+            feed._sync_realtime_kbars_and_quote(clean_sym)
+            if not feed.connected and actual_user and ts_pwd:
                 feed.start(actual_user, ts_pwd, clean_sym)
-                for _ in range(20):
-                    time.sleep(0.5)
-                    if feed.ta_rcv_done or "失敗" in feed.status_msg or "異常" in feed.status_msg:
-                        break
         # 清除舊分析快取與雲端情報快取，強制重抓最新國際盤/新聞並重算 AI 建議
         advice_cache_key = f"ai_advice_{clean_sym}_{chart_tf}"
         st.session_state.pop(advice_cache_key, None)
@@ -297,6 +293,7 @@ def main():
     # ==================== 2. 主戰情室區塊（支援自動定時刷新） ====================
     @st.fragment(run_every=auto_refresh_sec)
     def _render_unified_war_room():
+        feed.ensure_fresh_data(clean_sym, actual_user, ts_pwd)
         df_bars = feed.get_bars(timeframe=chart_tf, session="day_and_night")
         is_fut = FuturesAIAdvisor.is_futures(clean_sym)
         unit = "點" if is_fut else "元"

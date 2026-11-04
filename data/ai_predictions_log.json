@@ -108,5 +108,38 @@
     "ts": 1793756723.4,
     "time_str": "2026-11-04 09:45:23",
     "status": "PENDING"
+  },
+  {
+    "symbol": "TMF",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 20518.0,
+    "target_price": 20641.1,
+    "stop_loss": 20456.4,
+    "ts": 1793758105.1,
+    "time_str": "2026-11-04 10:08:25",
+    "status": "PENDING"
+  },
+  {
+    "symbol": "2330",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 1071.0,
+    "target_price": 1113.8,
+    "stop_loss": 1049.6,
+    "ts": 1793758105.1,
+    "time_str": "2026-11-04 10:08:25",
+    "status": "PENDING"
+  },
+  {
+    "symbol": "TMFR1",
+    "timeframe": "5m",
+    "action": "BUY_LONG",
+    "entry_price": 22350.0,
+    "target_price": 22484.1,
+    "stop_loss": 22283.0,
+    "ts": 1793758105.1,
+    "time_str": "2026-11-04 10:08:25",
+    "status": "PENDING"
   }
 ]
