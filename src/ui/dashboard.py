@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 from src.ai.advisor import FuturesAIAdvisor, FuturesAdvice
 from src.ai.cloud_intel import CloudIntelligenceHub, CloudIntelSnapshot
 from src.broker.taishin_quote import TaishinQuoteFeed
+from src.data.symbol_lookup import get_symbol_name, format_symbol_display
 
 
 def load_taishin_default_config() -> dict:
@@ -106,14 +107,24 @@ DEFAULT_WATCHLIST = [
 
 def load_watchlist(path: str | Path = "config/watchlist.json") -> list[str]:
     p = Path(path)
+    raw_list: list[str] = []
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, list) and len(data) > 0:
-                return [str(x).strip() for x in data if str(x).strip()]
+                raw_list = [str(x).strip() for x in data if str(x).strip()]
         except Exception:
             pass
-    return list(DEFAULT_WATCHLIST)
+    if not raw_list:
+        raw_list = list(DEFAULT_WATCHLIST)
+
+    # 自動標準化為「代碼 (商品名稱)」格式，確保分析選單每個標的皆明確帶出中文名稱
+    normalized: list[str] = []
+    for item in raw_list:
+        formatted = format_symbol_display(item)
+        if formatted and formatted not in normalized:
+            normalized.append(formatted)
+    return normalized
 
 
 def save_watchlist(items: list[str], path: str | Path = "config/watchlist.json") -> None:
@@ -132,6 +143,12 @@ def add_symbol_to_watchlist(code: str, name_note: str = "", path: str | Path = "
         return False, f"商品代碼 `{clean_code}` 已經在清單中了！", items
 
     note = (name_note or "").strip()
+    if not note:
+        # 自動從內建字典或 TWSE 官方 API 帶出中文商品名稱
+        detected = get_symbol_name(clean_code)
+        if detected:
+            note = detected
+
     entry = f"{clean_code} ({note})" if note else clean_code
     items.insert(0, entry)
     save_watchlist(items, path)
@@ -149,7 +166,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.3"
+APP_VERSION = "v2.7.4"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -273,12 +290,22 @@ def main():
         wl_c1, wl_c2, wl_c3, wl_c4 = st.columns([1.2, 1.5, 1.0, 1.1])
         with wl_c1:
             new_sym_code = st.text_input("新增商品代碼", placeholder="例如: 2603 或 TMFR1", key="in_new_sym_code")
+            detected_name = get_symbol_name(new_sym_code) if new_sym_code else ""
+            if detected_name:
+                st.caption(f"✨ 系統已識別：**{detected_name}**")
         with wl_c2:
-            new_sym_note = st.text_input("商品名稱 (選填)", placeholder="例如: 長榮", key="in_new_sym_note")
+            clean_in_code = new_sym_code.strip().upper() if new_sym_code else ""
+            new_sym_note = st.text_input(
+                "商品名稱 (已自動帶出)",
+                value=detected_name,
+                placeholder=detected_name if detected_name else "例如: 長榮",
+                key=f"in_new_sym_note_{clean_in_code}",
+            )
         with wl_c3:
             st.write("")
             if st.button("➕ 新增商品", width="stretch", type="primary"):
-                ok_add, msg_add, updated_list = add_symbol_to_watchlist(new_sym_code, new_sym_note)
+                effective_note = new_sym_note.strip() if new_sym_note.strip() else detected_name
+                ok_add, msg_add, updated_list = add_symbol_to_watchlist(new_sym_code, effective_note)
                 if ok_add:
                     st.session_state["selected_watchlist_item"] = updated_list[0]
                     st.toast(msg_add)
