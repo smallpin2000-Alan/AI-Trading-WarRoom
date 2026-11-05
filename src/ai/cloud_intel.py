@@ -335,7 +335,6 @@ class CloudIntelligenceHub:
         try:
             records = cls._load_prediction_records()
             clean_sym = symbol.strip().upper()
-            # 避免同一商品在 3 分鐘內重複寫入相同預測
             now_ts = time.time()
             for r in reversed(records):
                 if r.get("symbol") == clean_sym and r.get("timeframe") == timeframe:
@@ -352,9 +351,10 @@ class CloudIntelligenceHub:
                 "stop_loss": round(stop_val, 2),
                 "ts": round(now_ts, 1),
                 "time_str": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "PENDING",  # PENDING / WIN / LOSS
+                "high_since": round(current_price, 2),
+                "low_since": round(current_price, 2),
+                "status": "PENDING",  # PENDING / WIN / LOSS / TIE
             })
-            # 僅保留最近 200 筆，輕量快速
             records = records[-200:]
             cls._save_prediction_records(records)
         except Exception:
@@ -365,6 +365,10 @@ class CloudIntelligenceHub:
         records = cls._load_prediction_records()
         changed = False
         now_ts = time.time()
+
+        is_futures = any(k in clean_sym for k in ["TMF", "TXF", "MTX", "MXF", "R1", "R2"])
+        # 扣除實戰摩擦成本 (現貨 0.6% 稅費，期貨 12 點價差與手續費)
+        min_win_return = 0.006 if not is_futures else (12.0 / current_price if current_price > 0 else 0.0006)
 
         for r in records:
             if r.get("symbol") != clean_sym or r.get("status") != "PENDING":
@@ -378,34 +382,47 @@ class CloudIntelligenceHub:
             if entry_p <= 0:
                 continue
 
+            # 動態維護期間最高/最低穿價
+            high_since = max(float(r.get("high_since", entry_p)), current_price)
+            low_since = min(float(r.get("low_since", entry_p)), current_price)
+            r["high_since"] = round(high_since, 2)
+            r["low_since"] = round(low_since, 2)
+
             if act == "BUY_LONG":
-                if target_p > entry_p and current_price >= target_p:
-                    r["status"] = "WIN"
-                    changed = True
-                elif stop_p > 0 and current_price <= stop_p:
+                # 嚴格實戰風控：若期間曾先跌破停損線，即便目前價格反彈亦判定為失敗 (LOSS)
+                if stop_p > 0 and low_since <= stop_p:
                     r["status"] = "LOSS"
                     changed = True
-                elif age_sec >= 900:  # 超過 15 分鐘依實際順向漲跌結算
-                    if current_price > entry_p * 1.0005:
+                elif target_p > entry_p and high_since >= target_p:
+                    r["status"] = "WIN"
+                    changed = True
+                elif age_sec >= 1200:  # 20 分鐘後以實質盈虧結算 (扣除交易稅費)
+                    net_ret = (current_price - entry_p) / entry_p
+                    if net_ret >= min_win_return:
                         r["status"] = "WIN"
-                        changed = True
-                    elif current_price < entry_p * 0.9995:
+                    elif net_ret <= -min_win_return:
                         r["status"] = "LOSS"
-                        changed = True
+                    else:
+                        r["status"] = "TIE"
+                    changed = True
+
             elif act == "SELL_SHORT":
-                if target_p > 0 and target_p < entry_p and current_price <= target_p:
-                    r["status"] = "WIN"
-                    changed = True
-                elif stop_p > 0 and current_price >= stop_p:
+                # 嚴格實戰風控：若期間曾先漲破停損線，判定為失敗 (LOSS)
+                if stop_p > 0 and high_since >= stop_p:
                     r["status"] = "LOSS"
                     changed = True
-                elif age_sec >= 900:
-                    if current_price < entry_p * 0.9995:
+                elif target_p > 0 and target_p < entry_p and low_since <= target_p:
+                    r["status"] = "WIN"
+                    changed = True
+                elif age_sec >= 1200:  # 20 分鐘後以實質盈虧結算
+                    net_ret = (entry_p - current_price) / entry_p
+                    if net_ret >= min_win_return:
                         r["status"] = "WIN"
-                        changed = True
-                    elif current_price > entry_p * 1.0005:
+                    elif net_ret <= -min_win_return:
                         r["status"] = "LOSS"
-                        changed = True
+                    else:
+                        r["status"] = "TIE"
+                    changed = True
 
         if changed:
             cls._save_prediction_records(records)
@@ -419,22 +436,28 @@ class CloudIntelligenceHub:
 
     @classmethod
     def _compute_stats_from_records(cls, records: List[dict], clean_sym: str, snap: CloudIntelSnapshot) -> None:
+        # 嚴格商品隔離：各商品各自統計實盤穿價結算紀錄，絕不跨商品挪用，杜絕虛假勝率！
         sym_settled = [r for r in records if r.get("symbol") == clean_sym and r.get("status") in ("WIN", "LOSS")]
-        if not sym_settled:
-            sym_settled = [r for r in records if r.get("status") in ("WIN", "LOSS")]
 
         wins = sum(1 for r in sym_settled if r.get("status") == "WIN")
         total = len(sym_settled)
         snap.ai_verified_count = total
-        if total > 0:
+        # 統計學門檻防護：若已結算樣本少於 5 筆，不宣稱勝率百分比，避免 1 戰 1 勝顯示虛假 100%
+        if total >= 5:
             snap.ai_win_rate = round((wins / total) * 100.0, 1)
             last_r = sym_settled[-1]
             outcome_zh = "✅ 命中目標" if last_r.get("status") == "WIN" else "❌ 觸及停損/反向"
-            snap.ai_self_review_note = f"前次 ({last_r.get('time_str', '')[-8:]}) 建議 {last_r.get('action')} 結果：{outcome_zh}"
+            snap.ai_self_review_note = f"實盤結算 {total} 次 (獲勝 {wins} / 失敗 {total - wins})，前次：{outcome_zh}"
+        elif total > 0:
+            snap.ai_win_rate = None
+            snap.ai_self_review_note = f"實盤累積樣本中 (已結算 {total}/5 筆，獲勝 {wins} 筆)"
         else:
             pending_cnt = sum(1 for r in records if r.get("symbol") == clean_sym and r.get("status") == "PENDING")
             snap.ai_win_rate = None
-            snap.ai_self_review_note = f"目前已記錄 {pending_cnt} 筆預測，等待後續行情驗證中"
+            if pending_cnt > 0:
+                snap.ai_self_review_note = f"實盤追蹤中 (等待穿價結算，目前掛單 {pending_cnt} 筆)"
+            else:
+                snap.ai_self_review_note = "新標的實盤信號追蹤中 (待累積驗證)"
 
     @classmethod
     def _load_prediction_records(cls) -> List[dict]:

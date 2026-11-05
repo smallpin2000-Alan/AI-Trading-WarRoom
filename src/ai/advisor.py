@@ -36,6 +36,10 @@ class FuturesAdvice:
     signal_summary: str = ""                           # 【訊號】：ORB 區間突破 / 布林順逆勢 / 動能轉折
     method_summary: str = ""                           # 【方法】：進場觸發條件、停損停利紀律
     backtest_summary: str = ""                         # 【近期回測驗證】：勝率、賺賠比、獲利因子 (Profit Factor)
+    backtest_win_rate: float = 0.0                     # 最適策略回測勝率 (例如 48.3%)
+    backtest_odds: float = 0.0                         # 賺賠比 (例如 1.12)
+    backtest_pf: float = 0.0                           # 獲利因子 (例如 1.05)
+    backtest_strategy: str = ""                        # 最適策略名稱 (例如 均線成本順勢策略)
     bb_upper: float = 0.0                              # 布林通道上軌 (壓力)
     bb_middle: float = 0.0                             # 布林通道中軸 (20MA 成本)
     bb_lower: float = 0.0                              # 布林通道下軌 (支撐)
@@ -170,6 +174,17 @@ class FuturesAIAdvisor:
         計算：勝率 (Win Rate)、賺賠比 (Odds)、獲利因子 (Profit Factor)，挑出最適應當前商品之策略！
         """
         closes = df["close"].to_list()
+        if "ma5" not in df.columns or "ma20" not in df.columns or "bb_up" not in df.columns:
+            closes_s = df["close"]
+            ma5_s = closes_s.rolling_mean(5)
+            ma20_s = closes_s.rolling_mean(20)
+            bb_std = closes_s.rolling_std(20).fill_nan(0.0)
+            df = df.with_columns([
+                ma5_s.alias("ma5"),
+                ma20_s.alias("ma20"),
+                (ma20_s + 2.0 * bb_std).alias("bb_up"),
+                (ma20_s - 2.0 * bb_std).alias("bb_low"),
+            ])
         ma5_list = df["ma5"].to_list()
         ma20_list = df["ma20"].to_list()
         bb_up_list = df["bb_up"].to_list()
@@ -608,6 +623,7 @@ class FuturesAIAdvisor:
                 df_slice=df.tail(15),
                 now_str=now_str,
                 cloud_intel=cloud_intel,
+                bt_metrics=bt_metrics,
             )
             if advice:
                 is_open, _ = cls.get_market_session_status(symbol)
@@ -643,6 +659,10 @@ class FuturesAIAdvisor:
             signal_summary=signal_summary,
             method_summary=method_summary,
             backtest_summary=bt_metrics["summary"],
+            backtest_win_rate=bt_metrics.get("win_rate", 0.0),
+            backtest_odds=bt_metrics.get("odds", 0.0),
+            backtest_pf=bt_metrics.get("profit_factor", 0.0),
+            backtest_strategy=bt_metrics.get("best_strategy", ""),
             bb_upper=round(bb_up, 1),
             bb_middle=round(ma20, 1),
             bb_lower=round(bb_low, 1),
@@ -687,6 +707,7 @@ class FuturesAIAdvisor:
         df_slice: pl.DataFrame,
         now_str: str,
         cloud_intel: Optional[CloudIntelSnapshot] = None,
+        bt_metrics: Optional[Dict[str, Any]] = None,
     ) -> Optional[FuturesAdvice]:
         """呼叫 Gemini 進行專業操盤顧問分析（採用台新 Nova API 指標/訊號/方法架構與布林/ATR 邊界約束）"""
         try:
@@ -790,6 +811,10 @@ class FuturesAIAdvisor:
                     signal_summary=str(parsed.get("signal_summary", default_signal_summary)),
                     method_summary=str(parsed.get("method_summary", default_method_summary)),
                     backtest_summary=bt_summary,
+                    backtest_win_rate=bt_metrics.get("win_rate", 0.0) if bt_metrics else 0.0,
+                    backtest_odds=bt_metrics.get("odds", 0.0) if bt_metrics else 0.0,
+                    backtest_pf=bt_metrics.get("profit_factor", 0.0) if bt_metrics else 0.0,
+                    backtest_strategy=bt_metrics.get("best_strategy", "") if bt_metrics else "",
                     bb_upper=round(bb_up, 1),
                     bb_middle=round(ma20, 1),
                     bb_lower=round(bb_low, 1),

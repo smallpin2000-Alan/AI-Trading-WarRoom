@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.1"
+APP_VERSION = "v2.7.2"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -191,7 +191,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-04 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-05 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
 
     if is_idle_sleeping:
         st.warning("⏰【智慧防呆休眠中】您已連續看盤超過 30 分鐘。為保護雲端免費額度（確保 0 元），自動刷新已暫停。")
@@ -474,11 +474,23 @@ def main():
             m5.metric("布林 / 短線目標點", "🌙 已收盤暫停")
 
         # 🌐 Google 雲端四維度綜合情報雷達（精簡一列展示 + 展開詳情）
-        win_rate_display = (
-            f"準確率 {intel_snap.ai_win_rate:.0f}% ({intel_snap.ai_verified_count}次驗證)"
-            if intel_snap.ai_win_rate is not None and intel_snap.ai_verified_count > 0
-            else intel_snap.ai_self_review_note
-        )
+        # 🎯 整合台新 Nova API 回測四大指標（勝率、賺賠比、獲利因子 PF）與實盤穿價追蹤，杜絕虛假 100% 勝率！
+        bt_wr = getattr(advice, "backtest_win_rate", 0.0)
+        bt_odds = getattr(advice, "backtest_odds", 0.0)
+        bt_pf = getattr(advice, "backtest_pf", 0.0)
+
+        if bt_wr > 0 and bt_pf > 0:
+            radar_strategy_display = f"回測勝率 {bt_wr:.1f}% ｜ PF {bt_pf:.2f} ｜ 賺賠比 {bt_odds:.2f}"
+        elif getattr(advice, "backtest_summary", ""):
+            radar_strategy_display = advice.backtest_summary.split("｜", 1)[-1].strip() if "｜" in advice.backtest_summary else advice.backtest_summary
+        else:
+            radar_strategy_display = "回測指標計算中"
+
+        if intel_snap.ai_win_rate is not None and intel_snap.ai_verified_count >= 5:
+            radar_live_subnote = f"實盤穿價準確率 {intel_snap.ai_win_rate:.0f}% ({intel_snap.ai_verified_count}次驗證)"
+        else:
+            radar_live_subnote = f"實盤追蹤：{intel_snap.ai_self_review_note}"
+
         top_news_preview = intel_snap.news_headlines[0] if intel_snap.news_headlines else "暫無重大突發新聞"
 
         st.markdown(f"""
@@ -490,7 +502,7 @@ def main():
                 <div>🌍 <b>國際連動：</b>{intel_snap.global_bias_label}<br/><span style="color:#848e9c; font-size:12.5px;">{intel_snap.global_summary_text}</span></div>
                 <div>📰 <b>即時新聞：</b>{intel_snap.news_sentiment_label}<br/><span style="color:#848e9c; font-size:12.5px;">{top_news_preview[:42]}</span></div>
                 <div>☁️ <b>雲端籌碼庫：</b>{"🟢 已連線" if intel_snap.gcs_connected else "⚪ 本地模式"}<br/><span style="color:#848e9c; font-size:12.5px;">{intel_snap.institutional_note}</span></div>
-                <div>🎯 <b>AI 歷史勝率：</b><span style="color:#40c4ff;">{win_rate_display}</span><br/><span style="color:#848e9c; font-size:12.5px;">{intel_snap.ai_self_review_note}</span></div>
+                <div>🎯 <b>策略勝率與實盤：</b><br/><span style="color:#40c4ff; font-weight:600;">{radar_strategy_display}</span><br/><span style="color:#848e9c; font-size:12px;">{radar_live_subnote}</span></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
