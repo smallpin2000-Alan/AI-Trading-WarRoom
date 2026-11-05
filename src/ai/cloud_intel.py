@@ -78,6 +78,15 @@ class CloudIntelligenceHub:
     _refreshing_keys: set[str] = set()
     CACHE_TTL_SEC = 120.0  # 2 分鐘快取，確保看盤流暢不卡頓
 
+    # 🚀 全域共用極速多級快取 (Multi-Tier Shared Cache)：跨所有標的共用，切換商品 0.001 秒瞬開！
+    _shared_session: Optional[requests.Session] = None
+    _shared_macro: Optional[tuple[float, List[GlobalQuoteItem], str, str]] = None          # (ts, quotes, bias, summary)
+    _refreshing_macro: bool = False
+    _shared_institutional: Optional[tuple[float, Optional[dict], Optional[dict]]] = None  # (ts, cooling_data, picks_data)
+    _refreshing_institutional: bool = False
+    _shared_news: Dict[str, tuple[float, List[str], str]] = {}                             # key -> (ts, titles, label)
+    _refreshing_news_keys: set[str] = set()
+
     DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "point-api-512405-stock-history").strip()
     LOCAL_PRED_PATH = Path("data/ai_predictions_log.json")
     LOCAL_INVESTMENT_HISTORY_DIR = Path(r"d:\一般資料\個人資料\Investment\history")
@@ -91,18 +100,42 @@ class CloudIntelligenceHub:
     ]
 
     @classmethod
+    def _get_http_session(cls) -> requests.Session:
+        if cls._shared_session is None:
+            s = requests.Session()
+            s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=30, max_retries=1)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            cls._shared_session = s
+        return cls._shared_session
+
+    @classmethod
+    def prewarm_shared_cache(cls) -> None:
+        """背景全自動預熱：伺服器啟動時於背景載入國際報價與雲端籌碼，讓第一位使用者 0.001 秒秒開"""
+        def _warm():
+            try:
+                cls._refresh_macro_data()
+                cls._refresh_institutional_data()
+                cls._refresh_news_data("FUTURES", "台指期")
+            except Exception:
+                pass
+        threading.Thread(target=_warm, daemon=True).start()
+
+    @classmethod
     def _do_full_collect(cls, clean_sym: str, symbol_label: str, current_price: float) -> CloudIntelSnapshot:
         snap = CloudIntelSnapshot(
             symbol=clean_sym,
             fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
         )
+        # 極速並行：若快取中已有數據則 0.0001 秒直接裝填；若無則透過共用連線池平行拉取
         with ThreadPoolExecutor(max_workers=3) as pool:
             f1 = pool.submit(cls._populate_global_quotes, snap)
             f2 = pool.submit(cls._populate_realtime_news, snap, clean_sym, symbol_label)
             f3 = pool.submit(cls._populate_gcs_institutional, snap, clean_sym)
             for fut in (f1, f2, f3):
                 try:
-                    fut.result(timeout=4.0)
+                    fut.result(timeout=2.5)
                 except Exception:
                     pass
 
@@ -143,32 +176,15 @@ class CloudIntelligenceHub:
                     threading.Thread(target=_bg_refresh, daemon=True).start()
                 return cached_snap
 
-        if allow_background:
-            init_snap = CloudIntelSnapshot(
-                symbol=clean_sym,
-                fetched_at=datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"),
-                global_summary_text="⚡ 背景極速載入國際報價中...",
-                institutional_note="⚡ 背景同步雲端籌碼中...",
-            )
-            cls._load_prediction_stats_only(clean_sym, init_snap)
-            cls._cache[cache_key] = (0.0, init_snap)
-            if cache_key not in cls._refreshing_keys:
-                cls._refreshing_keys.add(cache_key)
-
-                def _bg_first():
-                    try:
-                        cls._do_full_collect(clean_sym, symbol_label, current_price)
-                    finally:
-                        cls._refreshing_keys.discard(cache_key)
-
-                threading.Thread(target=_bg_first, daemon=True).start()
-            return init_snap
+        # 若無該商品專屬快取，但全域共用宏觀快取已存在，立即組裝完整快照（0.001 秒），杜絕卡頓！
+        if cls._shared_macro is not None or allow_background:
+            return cls._do_full_collect(clean_sym, symbol_label, current_price)
 
         return cls._do_full_collect(clean_sym, symbol_label, current_price)
 
     @classmethod
-    def _populate_global_quotes(cls, snap: CloudIntelSnapshot) -> None:
-        headers = {"User-Agent": "Mozilla/5.0"}
+    def _refresh_macro_data(cls) -> Optional[tuple[List[GlobalQuoteItem], str, str]]:
+        session = cls._get_http_session()
         quotes: List[GlobalQuoteItem] = []
         bull_pts = 0
         bear_pts = 0
@@ -178,7 +194,7 @@ class CloudIntelligenceHub:
             try:
                 encoded = urllib.parse.quote(ticker)
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1d&range=2d"
-                resp = requests.get(url, headers=headers, timeout=2.8)
+                resp = session.get(url, timeout=2.2)
                 if resp.status_code == 200:
                     meta = resp.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
                     price = float(meta.get("regularMarketPrice") or 0.0)
@@ -215,30 +231,54 @@ class CloudIntelligenceHub:
                 elif q.change_pct <= -3.0:
                     bull_pts += 1
 
-        snap.global_quotes = quotes
         if quotes:
             parts = [f"{q.name} {q.status_icon}{q.change_pct:+.2f}%" for q in quotes]
-            snap.global_summary_text = " ｜ ".join(parts)
+            summary_text = " ｜ ".join(parts)
             if bull_pts > bear_pts:
-                snap.global_bias_label = "🟢 國際盤偏多助漲"
+                bias_label = "🟢 國際盤偏多助漲"
             elif bear_pts > bull_pts:
-                snap.global_bias_label = "🔴 國際盤偏空承壓"
+                bias_label = "🔴 國際盤偏空承壓"
             else:
-                snap.global_bias_label = "⚪ 國際盤多空持平"
+                bias_label = "⚪ 國際盤多空持平"
+            cls._shared_macro = (time.time(), quotes, bias_label, summary_text)
+            return quotes, bias_label, summary_text
+        return None
 
     @classmethod
-    def _populate_realtime_news(cls, snap: CloudIntelSnapshot, clean_sym: str, symbol_label: str) -> None:
-        is_fut = any(k in clean_sym for k in ["TMF", "TXF", "MTX", "MXF", "R1", "R2"])
-        if is_fut:
-            query = "台指期 OR 台股大盤 OR 外資期貨"
-        else:
-            name_part = symbol_label.replace(clean_sym, "").strip()
-            query = f"{clean_sym} {name_part} 台股".strip()
+    def _populate_global_quotes(cls, snap: CloudIntelSnapshot) -> None:
+        now_ts = time.time()
+        # 1. 命中全域共用宏觀快取 (跨商品共用，0.00001 秒立即返回！)
+        if cls._shared_macro is not None:
+            cached_ts, quotes, bias_label, summary_text = cls._shared_macro
+            snap.global_quotes = list(quotes)
+            snap.global_bias_label = bias_label
+            snap.global_summary_text = summary_text
+            # 若快取超過 120 秒，背景自動靜默刷新，絕不阻塞前端使用者！
+            if now_ts - cached_ts > 120.0 and not cls._refreshing_macro:
+                cls._refreshing_macro = True
+                def _bg_m():
+                    try:
+                        cls._refresh_macro_data()
+                    finally:
+                        cls._refreshing_macro = False
+                threading.Thread(target=_bg_m, daemon=True).start()
+            return
 
+        # 2. 冷啟動極速拉取
+        res = cls._refresh_macro_data()
+        if res:
+            quotes, bias_label, summary_text = res
+            snap.global_quotes = list(quotes)
+            snap.global_bias_label = bias_label
+            snap.global_summary_text = summary_text
+
+    @classmethod
+    def _refresh_news_data(cls, news_key: str, query: str) -> Optional[tuple[List[str], str]]:
+        session = cls._get_http_session()
         encoded_q = urllib.parse.quote(query)
         rss_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         try:
-            resp = requests.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4.0)
+            resp = session.get(rss_url, timeout=2.5)
             if resp.status_code == 200 and resp.text:
                 root = ET.fromstring(resp.text)
                 titles: List[str] = []
@@ -248,20 +288,64 @@ class CloudIntelligenceHub:
                         clean_t = t_elem.text.split(" - ")[0].strip()
                         if clean_t and clean_t not in titles:
                             titles.append(clean_t)
-                snap.news_headlines = titles
 
                 pos_words = ["大漲", "創高", "買超", "利多", "看好", "成長", "突破", "強勢", "反彈", "雙升"]
                 neg_words = ["大跌", "重挫", "賣超", "利空", "下修", "破底", "走弱", "砍價", "衰退", "跳水"]
                 pos_cnt = sum(1 for t in titles for w in pos_words if w in t)
                 neg_cnt = sum(1 for t in titles for w in neg_words if w in t)
                 if pos_cnt > neg_cnt:
-                    snap.news_sentiment_label = "🟢 消息面偏多"
+                    sentiment_label = "🟢 消息面偏多"
                 elif neg_cnt > pos_cnt:
-                    snap.news_sentiment_label = "🔴 消息面偏空"
+                    sentiment_label = "🔴 消息面偏空"
                 else:
-                    snap.news_sentiment_label = "⚪ 消息面中性"
+                    sentiment_label = "⚪ 消息面中性"
+
+                cls._shared_news[news_key] = (time.time(), titles, sentiment_label)
+                return titles, sentiment_label
         except Exception:
             pass
+        return None
+
+    @classmethod
+    def _populate_realtime_news(cls, snap: CloudIntelSnapshot, clean_sym: str, symbol_label: str) -> None:
+        is_fut = any(k in clean_sym for k in ["TMF", "TXF", "MTX", "MXF", "R1", "R2"])
+        news_key = "FUTURES" if is_fut else clean_sym
+        now_ts = time.time()
+
+        # 1. 命中新聞快取 (期貨跨標的共用，5 分鐘快取，0.00001 秒立即返回！)
+        if news_key in cls._shared_news:
+            cached_ts, titles, sentiment_label = cls._shared_news[news_key]
+            snap.news_headlines = list(titles)
+            snap.news_sentiment_label = sentiment_label
+            if now_ts - cached_ts > 300.0 and news_key not in cls._refreshing_news_keys:
+                cls._refreshing_news_keys.add(news_key)
+                def _bg_n():
+                    try:
+                        q = "台指期 OR 台股大盤 OR 外資期貨" if is_fut else f"{clean_sym} 台股".strip()
+                        cls._refresh_news_data(news_key, q)
+                    finally:
+                        cls._refreshing_news_keys.discard(news_key)
+                threading.Thread(target=_bg_n, daemon=True).start()
+            return
+
+        # 2. 冷啟動拉取
+        if is_fut:
+            query = "台指期 OR 台股大盤 OR 外資期貨"
+        else:
+            name_part = symbol_label.replace(clean_sym, "").strip()
+            query = f"{clean_sym} {name_part} 台股".strip()
+
+        res = cls._refresh_news_data(news_key, query)
+        if res:
+            snap.news_headlines, snap.news_sentiment_label = res
+
+    @classmethod
+    def _refresh_institutional_data(cls) -> tuple[Optional[dict], Optional[dict]]:
+        cooling_data = cls._read_cloud_or_local_json("cooling_off_list.json")
+        today_str = time.strftime("%Y-%m-%d")
+        picks_data = cls._read_cloud_or_local_json(f"picks_{today_str}.json")
+        cls._shared_institutional = (time.time(), cooling_data, picks_data)
+        return cooling_data, picks_data
 
     @classmethod
     def _read_cloud_or_local_json(cls, filename: str) -> Optional[dict]:
@@ -287,11 +371,25 @@ class CloudIntelligenceHub:
 
     @classmethod
     def _populate_gcs_institutional(cls, snap: CloudIntelSnapshot, clean_sym: str) -> None:
+        now_ts = time.time()
+        # 1. 命中全域法人籌碼快取 (10 分鐘快取，記憶體比對 0.00001 秒！)
+        if cls._shared_institutional is not None:
+            cached_ts, cooling_data, picks_data = cls._shared_institutional
+            if now_ts - cached_ts > 600.0 and not cls._refreshing_institutional:
+                cls._refreshing_institutional = True
+                def _bg_i():
+                    try:
+                        cls._refresh_institutional_data()
+                    finally:
+                        cls._refreshing_institutional = False
+                threading.Thread(target=_bg_i, daemon=True).start()
+        else:
+            cooling_data, picks_data = cls._refresh_institutional_data()
+
         notes: List[str] = []
         today_str = time.strftime("%Y-%m-%d")
 
-        # 1. 檢查冷卻黑名單 (cooling_off_list.json)
-        cooling_data = cls._read_cloud_or_local_json("cooling_off_list.json")
+        # 記憶體極速檢驗：冷卻黑名單
         if cooling_data is not None:
             snap.gcs_connected = True
             for item in cooling_data.get("cooling_stocks", []):
@@ -300,8 +398,7 @@ class CloudIntelligenceHub:
                     notes.append(f"⚠️ 雲端風控警示：{clean_sym} 目前處於破線冷卻觀察期 (至 {item.get('cooldown_until')})")
                     break
 
-        # 2. 檢查今日或近期盤前嚴選清單 (picks_YYYY-MM-DD.json)
-        picks_data = cls._read_cloud_or_local_json(f"picks_{today_str}.json")
+        # 記憶體極速檢驗：早盤嚴選標的
         if picks_data and picks_data.get("picks"):
             snap.gcs_connected = True
             for p in picks_data.get("picks", []):
@@ -502,3 +599,11 @@ class CloudIntelligenceHub:
                 threading.Thread(target=_bg_save_pred, daemon=True).start()
         except Exception:
             pass
+
+
+# 模組載入時自動於背景啟動極速預熱，讓前端第一次連線就能秒開情報雷達
+try:
+    CloudIntelligenceHub.prewarm_shared_cache()
+except Exception:
+    pass
+

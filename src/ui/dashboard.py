@@ -149,7 +149,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.2"
+APP_VERSION = "v2.7.3"
 _refreshing_advice_keys: set[str] = set()
 
 
