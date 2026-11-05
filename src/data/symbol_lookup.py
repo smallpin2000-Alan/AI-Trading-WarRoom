@@ -215,6 +215,22 @@ def get_symbol_name(symbol_code: str) -> str:
         except Exception:
             pass
 
+        # 若 TWSE 查無結果，嘗試向櫃買中心 (TPEx) 興櫃股票 OpenAPI 查詢 (涵蓋全台 367+ 檔興櫃股票)
+        try:
+            esb_url = "https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics"
+            resp_esb = requests.get(esb_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=2.0)
+            if resp_esb.status_code == 200:
+                for row in resp_esb.json():
+                    sec_code = str(row.get("SecuritiesCompanyCode", "")).strip().upper()
+                    c_name = str(row.get("CompanyName", "")).strip()
+                    if sec_code and c_name:
+                        _memory_cache[sec_code] = c_name
+                _save_disk_cache()
+                if clean in _memory_cache:
+                    return _memory_cache[clean]
+        except Exception:
+            pass
+
     return ""
 
 
