@@ -24,7 +24,7 @@ def test_futures_ai_advisor_fallback():
     assert advice.long_probability >= 0.0
     assert advice.short_probability >= 0.0
     assert len(advice.rationale) > 0
-    assert advice.source in ["本地量化多空模型", "Gemini AI"]
+    assert advice.source in ["AI 量化多策略矩陣大腦 (方案B)", "本地量化多空模型", "Gemini AI"]
 
 
 def test_futures_ai_advisor_empty():

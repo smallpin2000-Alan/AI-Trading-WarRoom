@@ -16,6 +16,9 @@ from src.ai.advisor import FuturesAIAdvisor, FuturesAdvice
 from src.ai.cloud_intel import CloudIntelligenceHub, CloudIntelSnapshot
 from src.broker.taishin_quote import TaishinQuoteFeed
 from src.data.symbol_lookup import get_symbol_name, format_symbol_display
+from src.core.paper_trader import PaperTradingEngine, RiskConfig, OpenPosition
+from src.core.engine import ContractSpec
+from src.schema.strategy import StrategySchema
 
 
 def load_taishin_default_config() -> dict:
@@ -24,7 +27,7 @@ def load_taishin_default_config() -> dict:
         "sol_user_id": os.getenv("SOL_USER_ID", ""),
         "sol_password": os.getenv("SOL_PASSWORD", ""),
         "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
-        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
     }
     paths = [
         Path("config/taishin_config.json"),
@@ -49,6 +52,42 @@ def mask_id_number(raw_id: str) -> str:
     if len(raw_id) <= 3:
         return raw_id
     return raw_id[:3] + "*" * (len(raw_id) - 3)
+
+
+def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
+    """初始化並獲取全域紙上交易模擬引擎實例（自動從磁碟恢復狀態）"""
+    if "paper_trader" not in st.session_state:
+        # 預設採用微台 TMF 規格與預設順勢停損策略
+        sym_key = symbol.split(" ")[0].upper()
+        clean_key = "TMF" if "TMF" in sym_key else "MXF" if "MXF" in sym_key else "TXF" if "TXF" in sym_key else "TMF"
+        c_spec = ContractSpec.from_json(clean_key)
+        default_strat = StrategySchema.model_validate({
+            "id": "ai_copilot_auto",
+            "version": 1,
+            "symbol": clean_key,
+            "timeframe": "5m",
+            "session": "day_and_night",
+            "indicators": {
+                "ma5": {"type": "SMA", "source": "close", "length": 5},
+                "ma20": {"type": "SMA", "source": "close", "length": 20},
+            },
+            "entry_long": {"cross_above": ["ma5", "ma20"]},
+            "entry_short": {"cross_below": ["ma5", "ma20"]},
+            "exit": {
+                "stop_loss": {"type": "fixed_points", "value": 30.0},
+                "take_profit": {"type": "fixed_points", "value": 45.0},
+                "trailing_stop": {"type": "points", "value": 20.0, "activation_points": 20.0},
+            },
+        })
+        pt = PaperTradingEngine(
+            strategy=default_strat,
+            contract=c_spec,
+            initial_capital=100_000.0,
+            risk_config=RiskConfig(max_daily_loss=1500.0, max_contracts=1),
+        )
+        pt.load_state_from_disk()
+        st.session_state["paper_trader"] = pt
+    return st.session_state["paper_trader"]
 
 
 st.set_page_config(
@@ -166,7 +205,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.4"
+APP_VERSION = "v2.7.5"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -208,7 +247,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-05 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-09 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
 
     if is_idle_sleeping:
         st.warning("⏰【智慧防呆休眠中】您已連續看盤超過 30 分鐘。為保護雲端免費額度（確保 0 元），自動刷新已暫停。")
@@ -245,7 +284,7 @@ def main():
     with ctrl_c3:
         refresh_opt = st.selectbox(
             "🔄 畫面自動更新頻率 (離線自動休眠)",
-            ["1 分鐘 (推薦)", "3 分鐘", "5 分鐘", "30 秒", "10 秒", "關閉自動刷新"],
+            ["15 秒 (推薦極速風控)", "30 秒", "1 分鐘", "3 分鐘", "5 分鐘", "關閉自動刷新"],
             index=0,
             key="live_refresh_interval_opt",
         )
@@ -279,9 +318,11 @@ def main():
             if not feed.connected and actual_user and ts_pwd:
                 feed.start(actual_user, ts_pwd, clean_sym)
         # 清除舊分析快取與雲端情報快取，強制重抓最新國際盤/新聞並重算 AI 建議
-        advice_cache_key = f"ai_advice_{clean_sym}_{chart_tf}"
+        advice_cache_key = f"ai_advice_{APP_VERSION}_{clean_sym}_{chart_tf}"
         st.session_state.pop(advice_cache_key, None)
         global_advice_cache.pop(advice_cache_key, None)
+        st.session_state.pop(f"ai_advice_{clean_sym}_{chart_tf}", None)
+        global_advice_cache.pop(f"ai_advice_{clean_sym}_{chart_tf}", None)
         CloudIntelligenceHub._cache.pop(f"intel_{clean_sym}", None)
         st.rerun()
 
@@ -358,9 +399,11 @@ def main():
         now_ts = time.time()
         bar_sig = f"{df_bars.height}_{last_bar_time_str}"
         cached_entry = global_advice_cache.get(advice_key)
+        # 節流防爆頻率：在開盤時段至少快取 60 秒（1 分鐘），確保盤中靈敏反應且仍在 Google 每日免費額度內
+        ai_cache_ttl = float(default_cfg.get("predict_frequency", 60))
         if (
             cached_entry is not None
-            and (now_ts - cached_entry[0] < 90.0)
+            and (now_ts - cached_entry[0] < ai_cache_ttl)
             and cached_entry[1] == bar_sig
         ):
             advice: FuturesAdvice = cached_entry[2]
@@ -463,8 +506,13 @@ def main():
         # 注意：禁止任何開頭 4 空白縮排，避免被 Streamlit 誤判為 <pre><code> 程式碼區塊
         taishin_tri_block = ""
         if is_mkt_open and getattr(advice, "indicator_summary", ""):
+            ens_block = ""
+            if getattr(advice, "ensemble_votes_summary", ""):
+                ens_block = f'<div style="color: #69f0ae; margin-top: 2px;">⚡ <b>【量化矩陣大腦】：</b>{advice.ensemble_votes_summary} ｜ 最適戰法：<b>{advice.ensemble_best_model}</b></div>'
+
             taishin_tri_block = (
                 '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.16); font-size: 13.5px; color: #cfd8dc; line-height: 1.65;">'
+                f'{ens_block}'
                 f'<div>📐 <b>【指標 (Indicator)】：</b>{advice.indicator_summary}</div>'
                 f'<div>🚦 <b>【訊號 (Signal)】：</b>{advice.signal_summary}</div>'
                 f'<div>🎯 <b>【方法 (Method)】：</b>{advice.method_summary}</div>'
@@ -534,6 +582,14 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
+        # 展開多策略矩陣戰法明細
+        if getattr(advice, "ensemble_models_detail", None):
+            with st.expander("⚡ 展開檢視：【量化多策略矩陣】6大戰法即時評分、動態權重與回測勝率"):
+                st.caption("💡 矩陣大腦每根 K 棒並行回測 6 大經典戰法，自動分配高勝率戰法更大權重，過半數共振才發出明確多空訊號：")
+                df_ens = pd.DataFrame(advice.ensemble_models_detail)
+                df_ens.columns = ["策略戰法名稱", "即時訊號方向", "動態權重占比 (%)", "獲利因子 (PF)", "近期回測勝率 (%)"]
+                st.dataframe(df_ens, width="stretch", hide_index=True)
+
         with st.expander("📰 展開檢視：Google 雲端收集之最新財經新聞與國際報價明細"):
             ic1, ic2 = st.columns([1.1, 1.3])
             with ic1:
@@ -554,9 +610,199 @@ def main():
                 else:
                     st.caption("目前無相關新聞標題")
 
-        st.markdown("---")
+        # ==================== 2.5 🤖 AI 自動模擬操盤帳戶面板 ====================
+        pt = get_or_create_paper_trader("TMF")
 
-        # ==================== 3. 即時 K 線與 AI 預估走勢圖表 ====================
+        # 🎯 徹底解耦：無論使用者在上方看什麼商品（台積電、鴻海、聯發科），
+        # 期貨模擬操盤帳戶永遠 100% 獨立專注於微台指 (TMFR1) 的真實 K 線與價格！
+        feed_tmf_bars = df_bars
+        tmf_curr_p = curr_price
+        if not is_fut or "TMF" not in clean_sym:
+            # 若目前看板顯示的不是微台，獨立載入 TMFR1 專屬最新 K 線與價格
+            store_inst = feed.store or KBarStore()
+            tmf_dict = store_inst.load_kbars_dict("TMFR1")
+            if tmf_dict:
+                feed_tmf_bars = TaishinQuoteFeed._empty_bars_df()
+                # 建立獨立的 TMFR1 5分K
+                tmf_feed_temp = TaishinQuoteFeed(auto_load_store=False)
+                tmf_feed_temp.kbars_1m = tmf_dict
+                tmf_feed_temp.symbol = "TMFR1"
+                feed_tmf_bars = tmf_feed_temp.get_bars("5m")
+                last_tmf_dt = max(tmf_dict.keys())
+                tmf_curr_p = float(tmf_dict[last_tmf_dt]["close"])
+
+        # 判斷台指期開盤狀態
+        tmf_is_open, _ = FuturesAIAdvisor.get_market_session_status("TMF")
+
+        if pt.is_active and tmf_is_open and tmf_curr_p > 10000:
+            # 🛡️ 方案B保鏢機制：每 15 秒獨立執行微台專屬即時停損停利檢核
+            stop_res = pt.check_position_stops(current_price=tmf_curr_p, df_bars=feed_tmf_bars)
+            if stop_res:
+                st.toast(f"⚡ 微台風控即時執行：{stop_res}", icon="🛡️")
+
+            # 🧠 取得微台專屬 AI 大腦趨勢出訊號
+            tmf_advice = advice
+            if not is_fut or "TMF" not in clean_sym:
+                tmf_advice = FuturesAIAdvisor.analyze_market(
+                    df_bars=feed_tmf_bars,
+                    symbol="TMF",
+                    timeframe="5m",
+                    gemini_api_key=default_cfg.get("gemini_api_key", ""),
+                    gemini_model=default_cfg.get("gemini_model", "gemini-3.5-flash-lite"),
+                    cloud_intel=None,
+                    fast_local_only=True,
+                )
+
+            if tmf_advice and tmf_advice.action != "WAIT":
+                trade_res = pt.sync_with_ai_advice(
+                    action=tmf_advice.action,
+                    confidence=tmf_advice.confidence,
+                    current_price=tmf_curr_p,
+                    df_bars=feed_tmf_bars,
+                    source_note=tmf_advice.source,
+                    min_confidence=60.0,
+                )
+                if trade_res:
+                    st.toast(f"⚡ 微台自動撮合：{trade_res}", icon="🤖")
+
+        # 操盤狀態橫幅卡（永遠綁定微台專屬即時價格 tmf_curr_p）
+        unrealized_pnl = pt.get_unrealized_pnl(tmf_curr_p)
+        total_eq = pt.get_total_equity(tmf_curr_p)
+        ret_pct = ((total_eq - pt.initial_capital) / pt.initial_capital) * 100.0
+
+        pos_str = "空手等待訊號"
+        pos_color = "#848e9c"
+        if pt.position is not None:
+            dir_zh = "🟢 多單" if pt.position.direction == 1 else "🔴 空單"
+            sl_info = f" (停損: {pt.position.stop_loss_price:,.1f})" if pt.position.stop_loss_price else ""
+            pos_str = f"{dir_zh} {pt.position.contracts} 口 @ {pt.position.entry_price:,.1f}{sl_info}"
+            pos_color = "#00e676" if pt.position.direction == 1 else "#ff5252"
+
+        status_badge = "🟢 自動操盤運作中" if pt.is_active else "⏸ 自動操盤已暫停"
+        if pt.kill_switch_locked:
+            status_badge = "🚨 Kill Switch 鎖定中"
+        elif pt.daily_loss_locked:
+            status_badge = "🛑 單日風控鎖定中"
+
+        st.markdown(f"""
+        <div style="background-color: rgba(22, 26, 37, 0.9); border: 2px solid #2962ff; border-radius: 12px; padding: 16px 20px; margin: 10px 0 16px 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 8px;">
+                <span style="font-size: 17px; font-weight: 700; color: #40c4ff;">🤖 AI 期貨自動模擬操盤中心（微台 TMF 1口模擬）</span>
+                <span style="font-size: 13.5px; font-weight: 600; padding: 3px 10px; border-radius: 6px; background-color: rgba(41, 98, 255, 0.2); color: #82b1ff;">{status_badge}</span>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; font-size: 14px;">
+                <div>💼 <b>虛擬總權益：</b><span style="color:#ffffff; font-weight:700; font-size:16px;">{total_eq:,.0f} 元</span> <span style="font-size:12px; color:{'#00e676' if ret_pct>=0 else '#ff5252'};">({ret_pct:+.2f}%)</span></div>
+                <div>📊 <b>持倉部位：</b><span style="color:{pos_color}; font-weight:700;">{pos_str}</span></div>
+                <div>💰 <b>未實現損益：</b><span style="color:{'#00e676' if unrealized_pnl>=0 else '#ff5252'}; font-weight:700;">{unrealized_pnl:+,.0f} 元</span></div>
+                <div>🎯 <b>已實現損益：</b><span style="color:{'#00e676' if pt.realized_pnl>=0 else '#ff5252'}; font-weight:700;">{pt.realized_pnl:+,.0f} 元 ({len(pt.closed_trades)}筆)</span></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 操盤控制按鈕與緊急平倉
+        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.3, 1.2, 1.5, 2.0])
+        with ctrl_col1:
+            if not pt.is_active:
+                if pt.daily_loss_locked or pt.kill_switch_locked or pt.degradation_locked:
+                    if st.button("🔄 解鎖並重新啟動操盤", key="btn_restart_ai_trade", type="primary", help="解除單日虧損/熔斷鎖定，並重置本日新回合風控門檻重新開始操盤"):
+                        pt.reset_risk_locks(reset_daily_accounting=True)
+                        succ, msg = pt.start_session(credibility_passed=True)
+                        pt.save_state_to_disk()
+                        if succ:
+                            st.success(f"✅ {msg}")
+                        else:
+                            st.error(f"❌ {msg}")
+                        st.rerun()
+                else:
+                    if st.button("▶ 啟動 AI 自動操盤", key="btn_start_ai_trade", type="primary"):
+                        succ, msg = pt.start_session(credibility_passed=True)
+                        pt.save_state_to_disk()
+                        st.rerun()
+            else:
+                if st.button("⏸ 暫停自動操盤", key="btn_stop_ai_trade"):
+                    flat_msg = pt.stop_session(force_flat_price=tmf_curr_p)
+                    pt.save_state_to_disk()
+                    if flat_msg:
+                        st.info(flat_msg)
+                    st.rerun()
+        with ctrl_col2:
+            if st.button("🚨 一鍵緊急平倉 (Kill)", key="btn_kill_switch", help="立即市價平掉所有部位並鎖定系統"):
+                kill_msg = pt.trigger_kill_switch(current_price=tmf_curr_p)
+                pt.save_state_to_disk()
+                st.warning(kill_msg)
+                st.rerun()
+        with ctrl_col3:
+            if pt.kill_switch_locked or pt.daily_loss_locked or pt.degradation_locked:
+                if st.button("🔓 僅解除風控鎖定", key="btn_unlock_risk", help="僅解除鎖定狀態，暫不自動啟動下單"):
+                    pt.reset_risk_locks(reset_daily_accounting=True)
+                    pt.save_state_to_disk()
+                    st.rerun()
+            else:
+                st.caption("🟢 系統運行中 / 風控正常")
+        with ctrl_col4:
+            st.caption(f"🛡️ 嚴格風控：單日虧損上限 -{pt.risk_config.max_daily_loss:,.0f} 元 ｜ 連續 4 筆虧損強制休眠 ｜ 2倍ATR動態停損")
+
+        with st.expander("⚙️ 點擊自訂個人操盤策略（固定停損／移動停利／單日虧損風控）"):
+            sc1, sc2, sc3, sc4, sc5 = st.columns([1.2, 1.2, 1.2, 1.3, 1.0])
+            with sc1:
+                cur_sl = pt.strategy.exit.stop_loss.value if pt.strategy.exit.stop_loss and pt.strategy.exit.stop_loss.value else 45.0
+                new_sl = st.number_input("防守止損點數 (點)", min_value=10.0, max_value=300.0, value=float(cur_sl), step=5.0, help="進場後價格反向虧損達此點數，立即市價停損")
+            with sc2:
+                cur_tp = pt.strategy.exit.take_profit.value if pt.strategy.exit.take_profit and pt.strategy.exit.take_profit.value else 0.0
+                new_tp = st.number_input("固定停利點數 (0=不限制)", min_value=0.0, max_value=500.0, value=float(cur_tp), step=10.0, help="獲利達到此點數自動平倉入袋，0 代表依靠移動停利或訊號離場")
+            with sc3:
+                cur_ts = pt.strategy.exit.trailing_stop.value if pt.strategy.exit.trailing_stop else 30.0
+                new_ts = st.number_input("移動回檔鎖利 (點)", min_value=10.0, max_value=200.0, value=float(cur_ts), step=5.0, help="獲利自波段最高點回檔超過此點數，自動出場保住利潤")
+            with sc4:
+                cur_daily_loss = pt.risk_config.max_daily_loss
+                new_daily_loss = st.number_input("單日最大虧損上限 (元)", min_value=1000.0, max_value=50000.0, value=float(cur_daily_loss), step=500.0, help="當日累積虧損達到此金額時，強制停止當日所有交易")
+            with sc5:
+                st.write("")
+                st.write("")
+                if st.button("💾 儲存策略設定", key="btn_save_user_strategy", type="secondary"):
+                    from src.schema.strategy import StopLossSpec, TrailingStopSpec
+                    pt.strategy.exit.stop_loss = StopLossSpec(type="fixed_points", value=float(new_sl))
+                    if new_tp > 0:
+                        pt.strategy.exit.take_profit = StopLossSpec(type="fixed_points", value=float(new_tp))
+                    else:
+                        pt.strategy.exit.take_profit = None
+                    pt.strategy.exit.trailing_stop = TrailingStopSpec(type="points", value=float(new_ts), activation_points=float(new_ts))
+                    pt.risk_config.max_daily_loss = float(new_daily_loss)
+                    pt.save_state_to_disk()
+                    st.success("✅ 策略參數已即時套用並儲存！")
+                    st.rerun()
+
+        with st.expander("📋 展開檢視：AI 模擬操盤交易明細與風控稽核日誌"):
+            log_c1, log_c2 = st.columns([1.2, 1.0])
+            with log_c1:
+                st.markdown("**📜 已平倉歷史交易紀錄**")
+                if pt.closed_trades:
+                    t_rows = []
+                    for t in reversed(pt.closed_trades[-15:]):
+                        t_rows.append({
+                            "方向": "多" if t.direction == 1 else "空",
+                            "口數": t.contracts,
+                            "進場價": f"{t.entry_price:,.1f}",
+                            "出場價": f"{t.exit_price:,.1f}",
+                            "手續費+稅": f"{t.commission + t.tax:,.0f}",
+                            "淨損益": f"{t.net_pnl:+,.0f} 元",
+                            "出場原因": t.exit_reason,
+                        })
+                    st.dataframe(pd.DataFrame(t_rows), width="stretch", hide_index=True)
+                else:
+                    st.caption("目前尚無平倉交易紀錄")
+            with log_c2:
+                st.markdown("**🛡️ 即時風控與撮合稽核日誌**")
+                if pt.audit_logs:
+                    l_rows = [
+                        {"時間": l.timestamp[-8:], "事件": l.event_type, "訊息": l.message}
+                        for l in reversed(pt.audit_logs[-15:])
+                    ]
+                    st.dataframe(pd.DataFrame(l_rows), width="stretch", hide_index=True)
+                else:
+                    st.caption("目前尚無稽核日誌")
+
+        st.markdown("---")
         k_top1, k_top2, k_top3 = st.columns([2.3, 1.0, 0.9])
         with k_top1:
             if is_mkt_open:

@@ -16,6 +16,14 @@ from src.schema.strategy import (
 )
 from src.core.indicators import IndicatorEngine
 from src.ai.confidence_engine import ConfidenceEngine
+from src.core.exits import (
+    add_exit_atr_columns,
+    read_atr_values,
+    can_open_position,
+    compute_exit_levels,
+    compute_contracts,
+    settlement_cutoff_state,
+)
 
 
 @dataclass
@@ -208,17 +216,21 @@ class EventDrivenEngine:
             df_ind = ConfidenceEngine.compute_confidence_series(
                 df_ind, base_threshold=cf_spec.threshold, regime_adaptive=cf_spec.regime_adaptive
             )
+        # 補齊 ATR 出場相關欄位
+        df_ind = add_exit_atr_columns(df_ind, self.strategy)
         cols = {col: df_ind[col].to_list() for col in df_ind.columns}
         n_bars = df_ind.height
 
         slippage = self.strategy.execution.slippage_points * cost_multiplier
-        contracts = self.strategy.position_sizing.contracts
+        default_contracts = self.strategy.position_sizing.contracts
 
         pos_dir = 0           # 0: 空手, 1: 多單, -1: 空單
+        contracts = default_contracts
         entry_price = 0.0
         entry_idx = 0
         highest_since_entry = 0.0
         lowest_since_entry = float("inf")
+        entry_atr: Dict[int, float] = {}
 
         pending_signal: Optional[tuple[int, str]] = None  # (target_dir, reason)
         trades: List[TradeRecord] = []
@@ -226,14 +238,13 @@ class EventDrivenEngine:
         realized_equity = self.initial_capital
 
         sl_spec = self.strategy.exit.stop_loss
-        tp_spec = self.strategy.exit.take_profit
-        ts_spec = self.strategy.exit.trailing_stop
 
         for i in range(n_bars):
             o = float(cols["open"][i])
             h = float(cols["high"][i])
             l = float(cols["low"][i])
             c = float(cols["close"][i])
+            bar_ts = cols["timestamp"][i] if "timestamp" in cols else None
 
             # Step A: 在當根 K 棒開盤執行前一根收盤產生的訊號 (fill_at = next_bar_open)
             if pending_signal is not None:
@@ -252,35 +263,39 @@ class EventDrivenEngine:
 
                 # 若目標為建新倉 (1 或 -1)
                 if target_dir != 0:
-                    pos_dir = target_dir
-                    entry_idx = i
-                    entry_price = o + slippage if pos_dir == 1 else o - slippage
-                    highest_since_entry = entry_price
-                    lowest_since_entry = entry_price
+                    cand_entry_price = o + slippage if target_dir == 1 else o - slippage
+                    # 讀取進場前一根收盤 (或當根) 之 ATR
+                    atr_now = read_atr_values(cols, self.strategy, max(0, i - 1))
+                    can_open, err_msg = can_open_position(self.strategy, cand_entry_price, atr_now)
+                    if can_open:
+                        calc_contracts = compute_contracts(
+                            self.strategy,
+                            realized_equity,
+                            self.contract.point_value,
+                            cand_entry_price,
+                            atr_now,
+                        )
+                        if calc_contracts > 0:
+                            pos_dir = target_dir
+                            contracts = calc_contracts
+                            entry_idx = i
+                            entry_price = cand_entry_price
+                            highest_since_entry = entry_price
+                            lowest_since_entry = entry_price
+                            entry_atr = atr_now
 
             # Step B: 若持有部位，檢查當根 K 棒盤中是否觸發停損 / 移動停損 / 停利 (含跳空穿價規則)
             if pos_dir != 0:
-                stop_price: Optional[float] = None
-                stop_reason = "stop_loss"
-
-                # 1. 固定點數 / 百分比停損
-                if sl_spec is not None and sl_spec.type in ("fixed_points", "percent") and sl_spec.value is not None:
-                    dist = sl_spec.value if sl_spec.type == "fixed_points" else entry_price * (sl_spec.value / 100.0)
-                    stop_price = (entry_price - dist) if pos_dir == 1 else (entry_price + dist)
-
-                # 2. 移動停損 (以進場後截至前一根極值計算保護價，避免當根高低點順序未知問題)
-                if ts_spec is not None:
-                    ts_dist = ts_spec.value if ts_spec.type == "points" else entry_price * (ts_spec.value / 100.0)
-                    if pos_dir == 1 and (highest_since_entry - entry_price) >= ts_spec.activation_points:
-                        ts_candidate = highest_since_entry - ts_dist
-                        if stop_price is None or ts_candidate > stop_price:
-                            stop_price = ts_candidate
-                            stop_reason = "trailing_stop"
-                    elif pos_dir == -1 and (entry_price - lowest_since_entry) >= ts_spec.activation_points:
-                        ts_candidate = lowest_since_entry + ts_dist
-                        if stop_price is None or ts_candidate < stop_price:
-                            stop_price = ts_candidate
-                            stop_reason = "trailing_stop"
+                current_atr = read_atr_values(cols, self.strategy, max(0, i - 1))
+                stop_price, tp_price, stop_reason = compute_exit_levels(
+                    self.strategy,
+                    pos_dir,
+                    entry_price,
+                    highest_since_entry,
+                    lowest_since_entry,
+                    entry_atr,
+                    current_atr,
+                )
 
                 # 檢查是否觸發停損 (含 Gap Execution Rule 跳空穿價)
                 stopped_out = False
@@ -308,11 +323,9 @@ class EventDrivenEngine:
                         pos_dir = 0
                         stopped_out = True
 
-                # 3. 若未停損，檢查固定點數停利與更新極值
+                # 檢查固定點數/百分比/ATR 停利與更新極值
                 if not stopped_out and pos_dir != 0:
-                    if tp_spec is not None and tp_spec.type in ("fixed_points", "percent") and tp_spec.value is not None:
-                        tp_dist = tp_spec.value if tp_spec.type == "fixed_points" else entry_price * (tp_spec.value / 100.0)
-                        tp_price = (entry_price + tp_dist) if pos_dir == 1 else (entry_price - tp_dist)
+                    if tp_price is not None:
                         if pos_dir == 1 and h >= tp_price:
                             raw_exit = max(tp_price, o)
                             fill_exit = raw_exit - slippage
@@ -339,35 +352,55 @@ class EventDrivenEngine:
 
             # Step C: K 棒收盤確認訊號 (signal_on = bar_close)，排入下一根開盤執行
             if i < n_bars - 1:
-                # 1. 檢查指標型出場 (indicator_cross)
-                if pos_dir == 1 and sl_spec and sl_spec.type == "indicator_cross" and sl_spec.long:
-                    if self._eval_condition(sl_spec.long, cols, i):
-                        pending_signal = (0, "indicator_exit")
-                elif pos_dir == -1 and sl_spec and sl_spec.type == "indicator_cross" and sl_spec.short:
-                    if self._eval_condition(sl_spec.short, cols, i):
-                        pending_signal = (0, "indicator_exit")
+                # 0. 檢查結算日強制平倉 (time_exit)
+                force_settle_exit, block_settle_entry = settlement_cutoff_state(
+                    self.strategy, self.contract.settlement_rule, bar_ts
+                )
+                if force_settle_exit and pos_dir != 0:
+                    pending_signal = (0, "settlement_exit")
+                elif block_settle_entry:
+                    # 結算前截止期不建新倉，若有部位且未平倉則平倉
+                    if pos_dir != 0:
+                        pending_signal = (0, "settlement_exit")
+                else:
+                    # 1. 檢查指標型出場 (indicator_cross)
+                    if pos_dir == 1 and sl_spec and sl_spec.type == "indicator_cross" and sl_spec.long:
+                        if self._eval_condition(sl_spec.long, cols, i):
+                            pending_signal = (0, "indicator_exit")
+                    elif pos_dir == -1 and sl_spec and sl_spec.type == "indicator_cross" and sl_spec.short:
+                        if self._eval_condition(sl_spec.short, cols, i):
+                            pending_signal = (0, "indicator_exit")
 
-                # 2. 檢查進場或反手訊號 (結合 AI 信心度閾值與市場狀態過濾)
-                long_sig = self._eval_condition(self.strategy.entry_long, cols, i)
-                short_sig = self._eval_condition(self.strategy.entry_short, cols, i)
+                    # 2. 檢查進場或反手訊號 (結合 AI 信心度閾值與市場狀態過濾)
+                    long_sig = self._eval_condition(self.strategy.entry_long, cols, i)
+                    short_sig = self._eval_condition(self.strategy.entry_short, cols, i)
 
-                if cf_spec.enabled and "long_confidence" in cols:
-                    eff_th = float(cols["effective_threshold"][i])
-                    if long_sig and float(cols["long_confidence"][i]) < eff_th:
-                        long_sig = False
-                    if short_sig and float(cols["short_confidence"][i]) < eff_th:
-                        short_sig = False
+                    if cf_spec.enabled and "long_confidence" in cols:
+                        eff_th = float(cols["effective_threshold"][i])
+                        if long_sig and float(cols["long_confidence"][i]) < eff_th:
+                            long_sig = False
+                        if short_sig and float(cols["short_confidence"][i]) < eff_th:
+                            short_sig = False
 
-                if long_sig and pos_dir <= 0:
-                    pending_signal = (1, "reverse" if pos_dir == -1 else "entry_long")
-                elif short_sig and pos_dir >= 0:
-                    pending_signal = (-1, "reverse" if pos_dir == 1 else "entry_short")
+                    if long_sig and pos_dir <= 0:
+                        pending_signal = (1, "reverse" if pos_dir == -1 else "entry_long")
+                    elif short_sig and pos_dir >= 0:
+                        pending_signal = (-1, "reverse" if pos_dir == 1 else "entry_short")
 
             # 記錄當根收盤權益曲線 (含未實現損益)
             unrealized = 0.0
             if pos_dir != 0:
                 unrealized = (c - entry_price) * pos_dir * self.contract.point_value * contracts
             equity_curve.append(realized_equity + unrealized)
+
+        # 資料結束若仍持有部位，以最後一根收盤價強制結算一筆 end_of_data 交易，讓回測統計真實完整
+        if pos_dir != 0 and n_bars > 0:
+            last_c = float(cols["close"][-1])
+            fill_exit = last_c - slippage if pos_dir == 1 else last_c + slippage
+            tr = self._calc_trade_Record(
+                pos_dir, contracts, entry_idx, n_bars - 1, entry_price, fill_exit, "end_of_data", cost_multiplier
+            )
+            trades.append(tr)
 
         return self._build_report(trades, equity_curve)
 

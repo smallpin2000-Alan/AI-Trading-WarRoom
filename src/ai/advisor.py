@@ -11,7 +11,9 @@ import numpy as np
 
 from src.ai.confidence_engine import MarketRegimeDetector, RegimeSnapshot
 from src.ai.cloud_intel import CloudIntelSnapshot, CloudIntelligenceHub
+from src.ai.ensemble import MultiModelEnsemble, EnsembleDecision
 from src.core.indicators import IndicatorEngine
+from src.core.engine import ContractSpec
 
 
 @dataclass
@@ -44,6 +46,10 @@ class FuturesAdvice:
     bb_middle: float = 0.0                             # 布林通道中軸 (20MA 成本)
     bb_lower: float = 0.0                              # 布林通道下軌 (支撐)
     atr_val: float = 0.0                               # 近 14 根 K 棒平均真實波幅 (ATR)
+    # 方案B：多策略矩陣與多模型投票狀態
+    ensemble_votes_summary: str = ""                   # 矩陣投票 (例如: 6戰法共振: 4多 1空 1平)
+    ensemble_best_model: str = ""                      # 最適權重戰法 (例如: 雙均線順勢 SMA 5/20)
+    ensemble_models_detail: list[dict] = field(default_factory=list) # 各戰法即時狀態明細
 
     def extract_price_levels(self, fallback_price: float = 0.0) -> Dict[str, float]:
         """從文字欄位提取數值型進場價、停損價、目標價，並以 ATR 與布林通道進行合理邊界校準，杜絕誇張衝天炮預估"""
@@ -391,6 +397,12 @@ class FuturesAIAdvisor:
         bb_width = (bb_span / max(1.0, ma20)) * 100.0 if ma20 > 0 else 1.0
         regime = MarketRegimeDetector.detect_regime_at(adx_val, bb_width)
 
+        # 🚨 乖離率與極端超買超賣過濾器 (防止追在阿呆谷或天花板)
+        # 價格距離 20MA 超過 2.2 倍 ATR，代表短線噴出或暴跌過劇，容易技術性劇烈反抽
+        ma20_gap = curr_p - ma20
+        is_extreme_oversold = ma20_gap <= -atr_val * 2.2 or bb_pos <= 0.05
+        is_extreme_overbought = ma20_gap >= atr_val * 2.2 or bb_pos >= 0.95
+
         # ORB (Opening Range / 近 15 根箱型高低區間) 與近 5 根短線高低點
         recent_n = min(30, len(closes))
         recent_high = float(max(highs[-recent_n:]))
@@ -473,6 +485,37 @@ class FuturesAIAdvisor:
         elif rsi_val < 28 and curr_p >= bb_low:
             long_score += 10
 
+        # (D) 方案B：多策略矩陣動態權重融合打分 (Multi-Strategy Matrix Ensemble)
+        # 呼叫 6 大經典戰法（均線順勢、EMA動能、通道突破、布林擠壓、MACD+RSI、KD+ADX）並行回測打分
+        ensemble_dec: Optional[EnsembleDecision] = None
+        try:
+            c_spec = ContractSpec.from_json("TMF")
+            if is_fut and symbol in ("MXF", "TXF"):
+                c_spec = ContractSpec.from_json(symbol)
+            ensemble_dec = MultiModelEnsemble.evaluate_ensemble(
+                df=df,
+                contract=c_spec,
+                initial_capital=100_000.0,
+                method="dynamic_weighted",
+                threshold=60.0,
+                regime_adaptive=True,
+            )
+        except Exception:
+            ensemble_dec = None
+
+        if ensemble_dec is not None and ensemble_dec.total_active_models > 0:
+            # 融合多策略矩陣權重打分
+            ens_long_w = ensemble_dec.ensemble_long_conf
+            ens_short_w = ensemble_dec.ensemble_short_conf
+            long_score += int(ens_long_w * 0.7)
+            short_score += int(ens_short_w * 0.7)
+
+            # 依投票制加成
+            if ensemble_dec.bull_votes > ensemble_dec.bear_votes:
+                long_score += (ensemble_dec.bull_votes - ensemble_dec.bear_votes) * 8
+            elif ensemble_dec.bear_votes > ensemble_dec.bull_votes:
+                short_score += (ensemble_dec.bear_votes - ensemble_dec.bull_votes) * 8
+
         # 融合 Google 雲端四維度情報加權
         if cloud_intel is not None:
             if "偏多" in cloud_intel.global_bias_label:
@@ -510,7 +553,7 @@ class FuturesAIAdvisor:
         if cloud_intel is not None:
             intel_tail = f" 結合雲端情報：{cloud_intel.global_bias_label}、{cloud_intel.news_sentiment_label}。"
 
-        if base_long_prob >= 60.0 and not is_high_stalling:
+        if base_long_prob >= 60.0 and not is_high_stalling and not is_extreme_overbought:
             action = "BUY_LONG"
             action_label = "🟢 建議偏多買進 (BUY LONG)"
             conf = base_long_prob
@@ -540,7 +583,7 @@ class FuturesAIAdvisor:
                 f"【訊號】目前布林軌道位置在 {bb_pos*100:.0f}%，{bt_metrics['summary']}。{intel_tail}"
                 f"【方法】短線第一目標對齊布林上軌壓力 {tp_pt:,.1f} {unit}（約 {tp_gap/atr_val:.1f} 倍 ATR 合理波幅），防守線設於 {sl_pt:,.1f} {unit}。"
             )
-        elif base_short_prob >= 60.0 and not is_low_stalling:
+        elif base_short_prob >= 60.0 and not is_low_stalling and not is_extreme_oversold:
             action = "SELL_SHORT"
             action_label = "🔴 建議偏空賣出 (SELL SHORT)"
             conf = base_short_prob
@@ -626,6 +669,22 @@ class FuturesAIAdvisor:
                 bt_metrics=bt_metrics,
             )
             if advice:
+                # 將多策略矩陣戰法資訊融合進 Gemini Advice，讓畫面與操盤同時享有 AI 與多策略矩陣數據
+                if ensemble_dec is not None and ensemble_dec.total_active_models > 0:
+                    advice.ensemble_votes_summary = f"6大戰法共振: {ensemble_dec.bull_votes}多 {ensemble_dec.bear_votes}空 {ensemble_dec.neutral_votes}平 (整體多方信心度 {ensemble_dec.ensemble_long_conf:.0f}%)"
+                    best_m = max(ensemble_dec.models, key=lambda m: (m.dynamic_weight, m.report.profit_factor), default=None)
+                    if best_m:
+                        advice.ensemble_best_model = f"{best_m.display_name} (PF: {best_m.report.profit_factor:.2f}, 勝率: {best_m.report.win_rate:.0f}%)"
+                    advice.ensemble_models_detail = [
+                        {
+                            "name": m.display_name,
+                            "signal": "看多 🟢" if m.latest_signal == 1 else "看空 🔴" if m.latest_signal == -1 else "觀望 ⚪",
+                            "weight": round(m.dynamic_weight * 100, 1),
+                            "pf": round(m.report.profit_factor, 2) if m.report.profit_factor != float("inf") else 3.0,
+                            "win_rate": round(m.report.win_rate, 1),
+                        }
+                        for m in ensemble_dec.models
+                    ]
                 is_open, _ = cls.get_market_session_status(symbol)
                 if is_open:
                     levels = advice.extract_price_levels(fallback_price=curr_p)
@@ -638,6 +697,27 @@ class FuturesAIAdvisor:
                         stop_val=levels["stop_loss"],
                     )
                 return advice
+
+        ens_summary = ""
+        ens_best = ""
+        ens_details = []
+        if ensemble_dec is not None and ensemble_dec.total_active_models > 0:
+            ens_summary = f"6大戰法共振: {ensemble_dec.bull_votes}多 {ensemble_dec.bear_votes}空 {ensemble_dec.neutral_votes}平 (整體多方信心度 {ensemble_dec.ensemble_long_conf:.0f}%)"
+            # 找出權重最高且回測表現最好的模組
+            best_m = max(ensemble_dec.models, key=lambda m: (m.dynamic_weight, m.report.profit_factor), default=None)
+            if best_m:
+                ens_best = f"{best_m.display_name} (PF: {best_m.report.profit_factor:.2f}, 勝率: {best_m.report.win_rate:.0f}%)"
+            for m in ensemble_dec.models:
+                ens_details.append({
+                    "name": m.display_name,
+                    "signal": "看多 🟢" if m.latest_signal == 1 else "看空 🔴" if m.latest_signal == -1 else "觀望 ⚪",
+                    "weight": round(m.dynamic_weight * 100, 1),
+                    "pf": round(m.report.profit_factor, 2) if m.report.profit_factor != float("inf") else 3.0,
+                    "win_rate": round(m.report.win_rate, 1),
+                })
+            # 如果多策略矩陣有明確方向，將其寫入白話理由中
+            if ens_summary:
+                rationale += f"【量化矩陣大腦】：{ens_summary}，最佳權重戰法為【{ens_best}】。"
 
         fallback_advice = FuturesAdvice(
             symbol=symbol,
@@ -654,7 +734,7 @@ class FuturesAIAdvisor:
             target_price=f"{tp_pt:,.1f} {unit}",
             rationale=rationale,
             generated_at=now_str,
-            source="本地量化多空模型",
+            source="AI 量化多策略矩陣大腦 (方案B)",
             indicator_summary=indicator_summary,
             signal_summary=signal_summary,
             method_summary=method_summary,
@@ -667,6 +747,9 @@ class FuturesAIAdvisor:
             bb_middle=round(ma20, 1),
             bb_lower=round(bb_low, 1),
             atr_val=round(atr_val, 1),
+            ensemble_votes_summary=ens_summary,
+            ensemble_best_model=ens_best,
+            ensemble_models_detail=ens_details,
         )
         is_open, _ = cls.get_market_session_status(symbol)
         if is_open:
@@ -763,12 +846,16 @@ class FuturesAIAdvisor:
   "rationale": "依【指標】【訊號】【方法】三要素撰寫 110~150 字繁體中文專業分析"
 }}
 """
-            model_target = model_name or "gemini-2.5-flash"
-            if "gemini-3.5" in model_target:
-                model_target = "gemini-2.5-flash"
+            # 自動選用最佳穩定低延遲模型，以 gemini-3.5-flash-lite 為首選避免 503 伺服器超載
+            model_target = model_name or "gemini-3.5-flash-lite"
+            if "gemini-2.5" in model_target or model_target == "gemini-3.5-flash":
+                model_target = "gemini-3.5-flash-lite"
 
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_target}:generateContent?key={api_key}"
-            headers = {"Content-Type": "application/json"}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_target}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            }
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {

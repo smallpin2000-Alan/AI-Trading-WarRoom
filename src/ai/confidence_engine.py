@@ -118,11 +118,21 @@ class ConfidenceEngine:
         vol_ratio = feat_df["feat_vol_ratio"].to_numpy()
 
         # 正規化各項特徵因子得分 (-1.0 ~ +1.0)
+        # 注意：杜絕前視偏差 (Look-ahead bias)，使用滾動式/擴展式 (expanding/rolling) 統計量，僅使用當根及過去 K 棒
         f_momentum = np.tanh(roc5 * 1.8 + roc10 * 1.2 + accel * 1.5)
         f_ma_trend = np.tanh(slope10 * 3.0 + slope20 * 2.5 + bias20 * 0.8)
         f_rsi = np.clip((rsi14 - 50.0) / 25.0, -1.5, 1.5)
-        macd_std = float(np.nanstd(macd)) + 1e-6
-        f_macd = np.tanh(macd / macd_std)
+
+        # 計算滾動式 MACD 標準差 (回看 30 根 K 棒，無未來資訊)
+        s_macd = pl.Series(macd)
+        macd_rolling_std = (
+            s_macd.rolling_std(window_size=30, min_samples=1)
+            .fill_null(strategy="backward")
+            .fill_null(1.0)
+            .to_numpy()
+        )
+        macd_rolling_std = np.where(macd_rolling_std < 1e-4, 1.0, macd_rolling_std)
+        f_macd = np.tanh(macd / macd_rolling_std)
         f_kd = np.tanh((kd_k - kd_d) / 12.0)
 
         # 量價確認放大器 (出量時動能權重放大)
@@ -147,12 +157,21 @@ class ConfidenceEngine:
         long_conf = np.clip(np.round(long_prob, 1), 1.0, 99.0)
         short_conf = np.clip(np.round(short_prob, 1), 1.0, 99.0)
 
-        med_bbw = float(np.nanmedian(bbw)) if n > 0 else 0.8
+        # 布林帶寬中位數亦採用滾動窗口 (回看 30 根 K 棒)，嚴格杜絕全局未來資訊偷看
+        s_bbw = pl.Series(bbw)
+        bbw_rolling_med = (
+            s_bbw.rolling_median(window_size=30, min_samples=1)
+            .fill_null(strategy="backward")
+            .fill_null(0.8)
+            .to_numpy()
+        )
+
         eff_thresholds: List[float] = []
         regimes: List[str] = []
 
         for i in range(n):
-            reg = MarketRegimeDetector.detect_regime_at(float(adx14[i]), float(bbw[i]), med_bbw)
+            cur_med_bbw = float(bbw_rolling_med[i]) if i < len(bbw_rolling_med) else 0.8
+            reg = MarketRegimeDetector.detect_regime_at(float(adx14[i]), float(bbw[i]), cur_med_bbw)
             regimes.append(reg.label_zh)
             if regime_adaptive:
                 eff_th = float(np.clip(base_threshold + reg.threshold_offset, 50.0, 90.0))

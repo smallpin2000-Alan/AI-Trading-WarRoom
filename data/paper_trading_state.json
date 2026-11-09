@@ -1,0 +1,720 @@
+{
+  "is_active": true,
+  "kill_switch_locked": false,
+  "daily_loss_locked": false,
+  "daily_profit_locked": false,
+  "degradation_locked": false,
+  "credibility_verified": true,
+  "daily_loss_baseline_pnl": -26900.0,
+  "initial_capital": 100000.0,
+  "realized_pnl": -31490.0,
+  "strategy": {
+    "id": "ai_copilot_auto",
+    "version": 1,
+    "symbol": "TMF",
+    "timeframe": "5m",
+    "session": "day_and_night",
+    "indicators": {
+      "ma5": {
+        "type": "SMA",
+        "source": "close",
+        "length": 5,
+        "timeframe": null
+      },
+      "ma20": {
+        "type": "SMA",
+        "source": "close",
+        "length": 20,
+        "timeframe": null
+      }
+    },
+    "entry_long": {
+      "cross_above": [
+        "ma5",
+        "ma20"
+      ],
+      "cross_below": null,
+      "gt": null,
+      "gte": null,
+      "lt": null,
+      "lte": null
+    },
+    "entry_short": {
+      "cross_above": null,
+      "cross_below": [
+        "ma5",
+        "ma20"
+      ],
+      "gt": null,
+      "gte": null,
+      "lt": null,
+      "lte": null
+    },
+    "exit": {
+      "stop_loss": {
+        "type": "fixed_points",
+        "value": 45.0,
+        "long": null,
+        "short": null
+      },
+      "take_profit": {
+        "type": "fixed_points",
+        "value": 90.0,
+        "long": null,
+        "short": null
+      },
+      "trailing_stop": {
+        "type": "points",
+        "value": 30.0,
+        "activation_points": 30.0
+      },
+      "time_exit": {
+        "before_settlement": true,
+        "minutes_before_close": 15
+      }
+    },
+    "execution": {
+      "signal_on": "bar_close",
+      "fill_at": "next_bar_open",
+      "order_type": "range_market",
+      "slippage_points": 1.0
+    },
+    "position_sizing": {
+      "type": "fixed",
+      "contracts": 1,
+      "risk_pct": null
+    },
+    "confidence_filter": {
+      "enabled": false,
+      "threshold": 60.0,
+      "regime_adaptive": true
+    }
+  },
+  "risk_config": {
+    "max_daily_loss": 6000.0,
+    "daily_profit_target": 0.0,
+    "max_consecutive_losses": 4,
+    "max_contracts": 1,
+    "check_margin": true
+  },
+  "position": null,
+  "closed_trades": [
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 375,
+      "entry_price": 38662.0,
+      "exit_price": 38889.0,
+      "gross_pnl": -2270.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -2310.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 377,
+      "entry_price": 38030.0,
+      "exit_price": 38261.0,
+      "gross_pnl": -2310.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -2350.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 378,
+      "entry_price": 38124.0,
+      "exit_price": 38035.0,
+      "gross_pnl": 890.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": 850.0,
+      "exit_reason": "take_profit"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 378,
+      "entry_price": 37724.0,
+      "exit_price": 38063.0,
+      "gross_pnl": -3390.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -3430.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 379,
+      "entry_price": 37698.0,
+      "exit_price": 37744.0,
+      "gross_pnl": -460.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -500.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": -1,
+      "entry_price": 38075.0,
+      "exit_price": 39987.0,
+      "gross_pnl": -19120.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -19160.0,
+      "exit_reason": "daily_loss_limit"
+    },
+    {
+      "direction": 1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 429,
+      "entry_price": 40006.0,
+      "exit_price": 39755.0,
+      "gross_pnl": -2510.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -2550.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 429,
+      "entry_price": 39685.0,
+      "exit_price": 39756.0,
+      "gross_pnl": -710.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -750.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 429,
+      "entry_price": 39712.0,
+      "exit_price": 39758.0,
+      "gross_pnl": -460.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -500.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 430,
+      "entry_price": 39758.0,
+      "exit_price": 39781.0,
+      "gross_pnl": -230.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -270.0,
+      "exit_reason": "trailing_stop"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 431,
+      "entry_price": 39745.0,
+      "exit_price": 39631.0,
+      "gross_pnl": 1140.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": 1100.0,
+      "exit_reason": "take_profit"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 431,
+      "entry_price": 39584.0,
+      "exit_price": 39635.0,
+      "gross_pnl": -510.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -550.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 266,
+      "entry_price": 39580.0,
+      "exit_price": 39635.0,
+      "gross_pnl": -550.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -590.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 438,
+      "entry_price": 39616.0,
+      "exit_price": 39527.0,
+      "gross_pnl": 890.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": 850.0,
+      "exit_reason": "take_profit"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 438,
+      "entry_price": 39531.0,
+      "exit_price": 39610.0,
+      "gross_pnl": -790.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -830.0,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "direction": -1,
+      "contracts": 1,
+      "entry_idx": 0,
+      "exit_idx": 268,
+      "entry_price": 39547.0,
+      "exit_price": 39593.0,
+      "gross_pnl": -460.0,
+      "commission": 24.0,
+      "tax": 16.0,
+      "net_pnl": -500.0,
+      "exit_reason": "stop_loss"
+    }
+  ],
+  "audit_logs": [
+    {
+      "timestamp": "2026-11-06 08:22:12",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:22:32",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已暫停自動訊號執行。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:23:30",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:46:02",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 38,662.0 (停損價: 38707.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度98%))",
+      "price": 38662.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:47:03",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 38,889.0，淨損益: -2,310 元",
+      "price": 38889.0,
+      "pnl": -2310.0
+    },
+    {
+      "timestamp": "2026-11-06 08:48:03",
+      "event_type": "RISK_BREACH",
+      "message": "🛑 觸發單日最大虧損鎖定 (當日損益 -2,310 元 <= -2,000 元)！已鎖定當日交易。",
+      "price": 38464.0,
+      "pnl": -2310.0
+    },
+    {
+      "timestamp": "2026-11-06 08:48:13",
+      "event_type": "RISK_BREACH",
+      "message": "風控攔截：已達單日最大虧損上限，當日禁止重新啟動交易。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:48:29",
+      "event_type": "SYSTEM",
+      "message": "已手動解除 Kill Switch / 單日損益 / 模型退化風控鎖定。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:48:30",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:48:31",
+      "event_type": "RISK_BREACH",
+      "message": "🛑 觸發單日最大虧損鎖定 (當日損益 -2,310 元 <= -2,000 元)！已鎖定當日交易。",
+      "price": 38470.0,
+      "pnl": -2310.0
+    },
+    {
+      "timestamp": "2026-11-06 08:48:40",
+      "event_type": "SYSTEM",
+      "message": "已手動解除 Kill Switch / 單日損益 / 模型退化風控鎖定。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:48:48",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:48:48",
+      "event_type": "RISK_BREACH",
+      "message": "🛑 觸發單日最大虧損鎖定 (當日損益 -2,310 元 <= -2,000 元)！已鎖定當日交易。",
+      "price": 38293.0,
+      "pnl": -2310.0
+    },
+    {
+      "timestamp": "2026-11-06 08:49:14",
+      "event_type": "RISK_BREACH",
+      "message": "風控攔截：已達單日最大虧損上限，當日禁止重新啟動交易。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:51:09",
+      "event_type": "RISK_BREACH",
+      "message": "風控攔截：已達單日最大虧損上限，當日禁止重新啟動交易。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:52:32",
+      "event_type": "SYSTEM",
+      "message": "已手動解除 Kill Switch / 單日損益 / 模型退化風控鎖定，並重置風控門檻。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:52:32",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:58:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 38,030.0 (停損價: 38075.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度99%))",
+      "price": 38030.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 08:59:01",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 38,261.0，淨損益: -2,350 元",
+      "price": 38261.0,
+      "pnl": -2350.0
+    },
+    {
+      "timestamp": "2026-11-06 09:00:02",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 38,124.0 (停損價: 38169.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度94%))",
+      "price": 38124.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 09:01:02",
+      "event_type": "ORDER_FILL",
+      "message": "🎯 空單停利成交 @ 38,035.0，淨損益: 850 元",
+      "price": 38035.0,
+      "pnl": 850.0
+    },
+    {
+      "timestamp": "2026-11-06 09:02:02",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 37,724.0 (停損價: 37769.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度99%))",
+      "price": 37724.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 09:03:02",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 38,063.0，淨損益: -3,430 元",
+      "price": 38063.0,
+      "pnl": -3430.0
+    },
+    {
+      "timestamp": "2026-11-06 09:04:02",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 37,698.0 (停損價: 37743.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度99%))",
+      "price": 37698.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 09:05:02",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 37,744.0，淨損益: -500 元",
+      "price": 37744.0,
+      "pnl": -500.0
+    },
+    {
+      "timestamp": "2026-11-06 09:06:02",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 37,893.0 (停損價: 37938.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度94%))",
+      "price": 37893.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 09:09:17",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 38,075.0 (停損價: 38120.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度97%))",
+      "price": 38075.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 09:10:50",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已暫停自動訊號執行。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:07:44",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:07:45",
+      "event_type": "RISK_BREACH",
+      "message": "🛑 觸發單日最大虧損鎖定 (本回合損益 -24,540 元 <= -6,000 元)！已於 39,987.0 自動強制平倉。",
+      "price": 39987.0,
+      "pnl": -19160.0
+    },
+    {
+      "timestamp": "2026-11-06 13:07:58",
+      "event_type": "SYSTEM",
+      "message": "已手動解除 Kill Switch / 單日損益 / 模型退化風控鎖定，並重置風控門檻。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:07:58",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:07:58",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：多單 (Long) 1 口 @ 40,006.0 (停損價: 39961.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度65%))",
+      "price": 40006.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:14:00",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 多單停損觸發 (stop_loss) @ 39,755.0，淨損益: -2,550 元",
+      "price": 39755.0,
+      "pnl": -2550.0
+    },
+    {
+      "timestamp": "2026-11-06 13:15:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,685.0 (停損價: 39730.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度72%))",
+      "price": 39685.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:16:00",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,756.0，淨損益: -750 元",
+      "price": 39756.0,
+      "pnl": -750.0
+    },
+    {
+      "timestamp": "2026-11-06 13:17:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,712.0 (停損價: 39757.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度76%))",
+      "price": 39712.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:18:05",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,758.0，淨損益: -500 元",
+      "price": 39758.0,
+      "pnl": -500.0
+    },
+    {
+      "timestamp": "2026-11-06 13:19:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,758.0 (停損價: 39803.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度87%))",
+      "price": 39758.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:21:00",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (trailing_stop) @ 39,781.0，淨損益: -270 元",
+      "price": 39781.0,
+      "pnl": -270.0
+    },
+    {
+      "timestamp": "2026-11-06 13:22:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,745.0 (停損價: 39790.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度87%))",
+      "price": 39745.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:24:00",
+      "event_type": "ORDER_FILL",
+      "message": "🎯 空單停利成交 @ 39,631.0，淨損益: 1,100 元",
+      "price": 39631.0,
+      "pnl": 1100.0
+    },
+    {
+      "timestamp": "2026-11-06 13:25:00",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,584.0 (停損價: 39629.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度90%))",
+      "price": 39584.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:26:00",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,635.0，淨損益: -550 元",
+      "price": 39635.0,
+      "pnl": -550.0
+    },
+    {
+      "timestamp": "2026-11-06 13:27:17",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,580.0 (停損價: 39625.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度88%))",
+      "price": 39580.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:28:20",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,635.0，淨損益: -590 元",
+      "price": 39635.0,
+      "pnl": -590.0
+    },
+    {
+      "timestamp": "2026-11-06 13:29:21",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,616.0 (停損價: 39661.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度79%))",
+      "price": 39616.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:30:20",
+      "event_type": "ORDER_FILL",
+      "message": "🎯 空單停利成交 @ 39,527.0，淨損益: 850 元",
+      "price": 39527.0,
+      "pnl": 850.0
+    },
+    {
+      "timestamp": "2026-11-06 13:31:20",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,531.0 (停損價: 39576.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度90%))",
+      "price": 39531.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:32:20",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,610.0，淨損益: -830 元",
+      "price": 39610.0,
+      "pnl": -830.0
+    },
+    {
+      "timestamp": "2026-11-06 13:33:20",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,547.0 (停損價: 39592.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度89%))",
+      "price": 39547.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 13:34:25",
+      "event_type": "STOP_OUT",
+      "message": "🛡️ 空單停損觸發 (stop_loss) @ 39,593.0，淨損益: -500 元",
+      "price": 39593.0,
+      "pnl": -500.0
+    },
+    {
+      "timestamp": "2026-11-06 13:35:21",
+      "event_type": "ORDER_FILL",
+      "message": "新倉成交：空單 (Short) 1 口 @ 39,656.0 (停損價: 39701.0, 原因: AI訊號進場 (AI 量化多策略矩陣大腦 (方案B), 信心度87%))",
+      "price": 39656.0,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 14:02:19",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 14:03:28",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已暫停自動訊號執行。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 14:03:29",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 14:03:30",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已暫停自動訊號執行。",
+      "price": null,
+      "pnl": null
+    },
+    {
+      "timestamp": "2026-11-06 14:03:30",
+      "event_type": "SYSTEM",
+      "message": "紙上交易已啟動 (策略: ai_copilot_auto v1, 標的: TMF)",
+      "price": null,
+      "pnl": null
+    }
+  ],
+  "updated_at": "2026-11-06 14:03:30"
+}
