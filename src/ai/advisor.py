@@ -374,10 +374,15 @@ class FuturesAIAdvisor:
         ma60 = _sf(df["ma60"][-1], curr_p)
         rsi_val = _sf(df["rsi"][-1], 50.0)
         adx_val = _sf(df["adx"][-1], 20.0)
-        fallback_atr = float(np.mean([h - l for h, l in zip(highs[-10:], lows[-10:])]))
+        recent_ranges = [max(0.0, float(h) - float(l)) for h, l in zip(highs[-14:], lows[-14:])]
+        median_bar_range = float(np.median(recent_ranges)) if recent_ranges else 15.0
+        fallback_atr = float(np.mean(recent_ranges[-10:])) if recent_ranges else 15.0
         raw_atr = _sf(df["atr"][-1], fallback_atr)
         if raw_atr <= 0:
             raw_atr = fallback_atr
+        # 防止跨日/跨盤跳空缺口造成單根 True Range 暴衝失真（限制不超過近14根實體振幅中位數的 2.2 倍）
+        if median_bar_range > 0 and raw_atr > max(median_bar_range * 2.2, fallback_atr * 1.5):
+            raw_atr = max(median_bar_range * 1.35, fallback_atr)
         atr_val = max(12.0, raw_atr) if is_fut else max(0.5, raw_atr)
 
         bb_up = _sf(df["bb_up"][-1], curr_p + atr_val * 2.0)

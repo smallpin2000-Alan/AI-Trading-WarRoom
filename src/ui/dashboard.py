@@ -56,12 +56,17 @@ def mask_id_number(raw_id: str) -> str:
     return raw_id[:3] + "*" * (len(raw_id) - 3)
 
 
+@st.cache_resource
+def _get_global_paper_trader_holder() -> dict:
+    """跨瀏覽器分頁共用的紙上交易模擬引擎單例容器，避免不同分頁自動刷新時互相覆蓋重置狀態"""
+    return {"instance": None}
+
+
 def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
-    """初始化並獲取全域紙上交易模擬引擎實例（自動從磁碟恢復狀態）"""
-    if (
-        "paper_trader" not in st.session_state
-        or getattr(st.session_state["paper_trader"], "VERSION", None) != PaperTradingEngine.VERSION
-    ):
+    """初始化並獲取全域紙上交易模擬引擎實例（自動從磁碟恢復狀態，跨分頁同步）"""
+    holder = _get_global_paper_trader_holder()
+    pt = holder.get("instance")
+    if pt is None or getattr(pt, "VERSION", None) != PaperTradingEngine.VERSION:
         # 預設採用微台 TMF 規格與預設順勢停損策略
         sym_key = symbol.split(" ")[0].upper()
         clean_key = "TMF" if "TMF" in sym_key else "MXF" if "MXF" in sym_key else "TXF" if "TXF" in sym_key else "TMF"
@@ -91,8 +96,9 @@ def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
             risk_config=RiskConfig(max_daily_loss=1500.0, max_contracts=1),
         )
         pt.load_state_from_disk()
-        st.session_state["paper_trader"] = pt
-    return st.session_state["paper_trader"]
+        holder["instance"] = pt
+    st.session_state["paper_trader"] = pt
+    return pt
 
 
 st.set_page_config(
@@ -210,7 +216,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.8.0"
+APP_VERSION = "v2.8.1"
 _refreshing_advice_keys: set[str] = set()
 
 

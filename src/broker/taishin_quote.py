@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 20
+    VERSION = 21
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -788,47 +788,84 @@ class TaishinQuoteFeed:
                 if front_q:
                     sym_id = front_q["SymbolID"]
                     last_p = float(front_q["CLastPrice"])
-                    if mkt_type == "0":
-                        r_1m = requests.post(
-                            "https://mis.taifex.com.tw/futures/api/getChartData1M",
-                            json={"SymbolID": sym_id, "MarketType": "0"},
-                            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-                            timeout=5,
-                        )
-                        rt_data = (r_1m.json().get("RtData") or {})
-                        c_date = str((rt_data.get("Quote") or {}).get("CDate") or today_date.strftime("%Y%m%d"))
-                        ticks_1m = rt_data.get("Ticks") or []
+
+                    def _pull_taifex_1m(target_mkt: str) -> int:
+                        nonlocal added, pulled_live
+                        cnt_1m = 0
+                        try:
+                            req_sym = sym_id
+                            if target_mkt == "0" and req_sym.endswith("-M"):
+                                req_sym = req_sym[:-2] + "-F"
+                            elif target_mkt == "1" and req_sym.endswith("-F"):
+                                req_sym = req_sym[:-2] + "-M"
+                            r_1m = requests.post(
+                                "https://mis.taifex.com.tw/futures/api/getChartData1M",
+                                json={"SymbolID": req_sym, "MarketType": target_mkt},
+                                headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+                                timeout=5,
+                            )
+                            rt_data = (r_1m.json().get("RtData") or {})
+                            c_date = str((rt_data.get("Quote") or {}).get("CDate") or today_date.strftime("%Y%m%d"))
+                            ticks_1m = rt_data.get("Ticks") or []
+                            with self.lock:
+                                for row in ticks_1m:
+                                    if len(row) < 6:
+                                        continue
+                                    t_hhmm = int(str(row[0]).strip().zfill(6)[:4] or 0)
+                                    if target_mkt == "1":
+                                        # 夜盤時段：以當下台灣時間精準推算日曆日，避免跨日錯置
+                                        hh_v = t_hhmm // 100
+                                        mm_v = t_hhmm % 100
+                                        if now_tw_fut.hour >= 15:
+                                            cal_d = today_date if hh_v >= 15 else (today_date + datetime.timedelta(days=1))
+                                        else:
+                                            cal_d = (today_date - datetime.timedelta(days=1)) if hh_v >= 15 else today_date
+                                        dt = datetime.datetime(cal_d.year, cal_d.month, cal_d.day, hh_v, mm_v, 0)
+                                    else:
+                                        dt = self._parse_kbar_datetime(c_date, t_hhmm)
+                                    if dt is None:
+                                        continue
+                                    c_v = float(row[4] or 0.0)
+                                    if c_v <= 0:
+                                        continue
+                                    self.kbars_1m[dt] = {
+                                        "timestamp": dt,
+                                        "open": float(row[1] or c_v),
+                                        "high": float(row[2] or c_v),
+                                        "low": float(row[3] or c_v),
+                                        "close": c_v,
+                                        "volume": max(1, int(float(row[5] or 1))),
+                                    }
+                                    added += 1
+                                    pulled_live += 1
+                                    cnt_1m += 1
+                        except Exception:
+                            pass
+                        return cnt_1m
+
+                    # 若目前處於夜盤時段，檢查當日日盤 (08:45~13:45) 是否缺漏（如雲端容器剛重啟），自動補齊日盤 300 根 1m K 棒，確保 20MA/60MA/ATR 連續不跳空！
+                    if mkt_type == "1":
+                        day_ref_date = today_date if now_tw_fut.hour >= 15 else (today_date - datetime.timedelta(days=1))
                         with self.lock:
-                            for row in ticks_1m:
-                                if len(row) < 6:
-                                    continue
-                                t_hhmm = int(str(row[0]).strip()[:4] or 0)
-                                dt = self._parse_kbar_datetime(c_date, t_hhmm)
-                                if dt is None:
-                                    continue
-                                c_v = float(row[4] or 0.0)
-                                if c_v <= 0:
-                                    continue
-                                self.kbars_1m[dt] = {
-                                    "timestamp": dt,
-                                    "open": float(row[1] or c_v),
-                                    "high": float(row[2] or c_v),
-                                    "low": float(row[3] or c_v),
-                                    "close": c_v,
-                                    "volume": max(1, int(float(row[5] or 1))),
-                                }
-                                added += 1
-                                pulled_live += 1
-                    else:
-                        # 夜盤時段：將期交所最新成交價直接更新至最新一根 1m K 棒
-                        with self.lock:
-                            if self.kbars_1m:
-                                latest_k_dt = max(self.kbars_1m.keys())
-                                kb_last = self.kbars_1m[latest_k_dt]
-                                kb_last["close"] = last_p
-                                kb_last["high"] = max(float(kb_last["high"]), last_p)
-                                kb_last["low"] = min(float(kb_last["low"]), last_p)
-                                pulled_live += 1
+                            day_session_cnt = sum(
+                                1 for dt in self.kbars_1m.keys()
+                                if dt.date() == day_ref_date and 8 <= dt.hour <= 13
+                            )
+                        if day_session_cnt < 100:
+                            _pull_taifex_1m("0")
+
+                    # 拉取當下盤別 (日盤 "0" 或夜盤 "1") 的期交所官方 1m K 線
+                    _pull_taifex_1m(mkt_type)
+
+                    # 同步將期交所最新成交價直接更新至最新一根 1m K 棒
+                    with self.lock:
+                        if self.kbars_1m:
+                            latest_k_dt = max(self.kbars_1m.keys())
+                            kb_last = self.kbars_1m[latest_k_dt]
+                            kb_last["close"] = last_p
+                            kb_last["high"] = max(float(kb_last["high"]), last_p)
+                            kb_last["low"] = min(float(kb_last["low"]), last_p)
+                            pulled_live += 1
 
                     with self.lock:
                         bid_q = float(front_q.get("CBidPrice1") or 0.0)

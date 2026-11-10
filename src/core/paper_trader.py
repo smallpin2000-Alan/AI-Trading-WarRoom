@@ -1,6 +1,7 @@
 # src/core/paper_trader.py
 from __future__ import annotations
 import json
+import time
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -65,7 +66,7 @@ class PaperTradingEngine:
     4. 內建單日最大虧損鎖定 (Daily Max Loss Limit) 與一鍵緊急平倉 (Kill Switch)。
     """
 
-    VERSION = 5
+    VERSION = 6
 
     def __init__(
         self,
@@ -101,6 +102,7 @@ class PaperTradingEngine:
         self.closed_trades: List[TradeRecord] = []
         self.audit_logs: List[AuditLogEntry] = []
         self._daily_loss_baseline_pnl: float = 0.0
+        self._last_reset_ts: float = 0.0
 
     def _log(
         self,
@@ -238,6 +240,7 @@ class PaperTradingEngine:
         self.degradation_locked = False
         self.order_safety_locked = False
         self.credibility_verified = True
+        self._last_reset_ts = time.time()
         self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
         if save_to_disk:
             self.save_state_to_disk()
@@ -562,6 +565,10 @@ class PaperTradingEngine:
 
         if not self.is_active or self.kill_switch_locked or self.daily_loss_locked or self.daily_profit_locked or self.degradation_locked:
             return "系統暫停或風控鎖定中"
+
+        # 剛執行「全部模擬重置」後的 12 秒冷卻保護期內，暫緩立即自動建倉，確保畫面乾淨呈現 100,000 元與 0 筆紀錄
+        if time.time() - getattr(self, "_last_reset_ts", 0.0) < 12.0:
+            return None
 
         # 2. 檢查盤中持倉是否觸發停損/停利 (呼叫專屬即時風控檢核)
         stop_res = self.check_position_stops(current_price, df_bars)
