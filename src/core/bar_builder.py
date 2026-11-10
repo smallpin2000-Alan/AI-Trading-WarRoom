@@ -11,6 +11,9 @@ class TickData:
     timestamp: datetime
     price: float
     volume: int
+    side: int = 0          # 1: 外盤主動買進(紅), -1: 內盤主動賣出(綠), 0: 中性(白)
+    bid_price: float = 0.0 # 當時委買一價
+    ask_price: float = 0.0 # 當時委賣一價
 
 
 class SharedBarBuilder:

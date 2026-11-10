@@ -73,6 +73,8 @@ class TradeRecord:
     tax: float
     net_pnl: float
     exit_reason: str        # "stop_loss", "take_profit", "trailing_stop", "indicator_exit", "reverse", "end_of_data"
+    entry_time: str = ""    # 格式 "%Y-%m-%d %H:%M"
+    exit_time: str = ""     # 格式 "%Y-%m-%d %H:%M"
 
 
 @dataclass

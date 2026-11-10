@@ -65,7 +65,7 @@ class PaperTradingEngine:
     4. 內建單日最大虧損鎖定 (Daily Max Loss Limit) 與一鍵緊急平倉 (Kill Switch)。
     """
 
-    VERSION = 2
+    VERSION = 5
 
     def __init__(
         self,
@@ -90,6 +90,8 @@ class PaperTradingEngine:
         self.daily_profit_locked: bool = False
         self.degradation_locked: bool = False
         self.credibility_verified: bool = False
+        self.order_safety_locked: bool = False   # 下單安全鎖 (True 時鎖定下單，不開新倉)
+        self.custom_tp_points: float = 0.0       # 自訂自動停利點數 (點)
 
         self.position: Optional[OpenPosition] = None
         self.pending_signal: Optional[tuple[int, str]] = None  # (target_dir, reason)
@@ -217,6 +219,29 @@ class PaperTradingEngine:
             self._daily_loss_baseline_pnl = self.realized_pnl
         self._log("SYSTEM", "已手動解除 Kill Switch / 單日損益 / 模型退化風控鎖定，並重置風控門檻。")
 
+    def reset_all_simulation(self, initial_capital: float = 100_000.0, save_to_disk: bool = True):
+        """
+        全部模擬重置：
+        清空所有未平倉部位、歷史平倉交易紀錄、風控鎖定與稽核日誌，
+        並將虛擬總資金恢復為初始設定（預設 100,000 元）。
+        """
+        self.initial_capital = float(initial_capital)
+        self.position = None
+        self.pending_signal = None
+        self.last_processed_bar_ts = None
+        self.closed_trades.clear()
+        self.audit_logs.clear()
+        self._daily_loss_baseline_pnl = 0.0
+        self.kill_switch_locked = False
+        self.daily_loss_locked = False
+        self.daily_profit_locked = False
+        self.degradation_locked = False
+        self.order_safety_locked = False
+        self.credibility_verified = True
+        self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
+        if save_to_disk:
+            self.save_state_to_disk()
+
     @property
     def consecutive_losses(self) -> int:
         """計算目前連續虧損筆數"""
@@ -249,7 +274,7 @@ class PaperTradingEngine:
         pos: OpenPosition,
         current_atr: Optional[dict[int, float]] = None,
     ) -> tuple[Optional[float], Optional[float], str]:
-        return compute_exit_levels(
+        sl_p, tp_p, reason = compute_exit_levels(
             self.strategy,
             pos.direction,
             pos.entry_price,
@@ -258,6 +283,10 @@ class PaperTradingEngine:
             pos.entry_atr,
             current_atr,
         )
+        if getattr(self, "custom_tp_points", 0.0) > 0:
+            custom_tp = pos.entry_price + self.custom_tp_points if pos.direction == 1 else pos.entry_price - self.custom_tp_points
+            tp_p = custom_tp
+        return sl_p, tp_p, reason
 
     def _open_new_position(
         self,
@@ -267,6 +296,10 @@ class PaperTradingEngine:
         reason: str,
         entry_atr: Optional[dict[int, float]] = None,
     ) -> bool:
+        if getattr(self, "order_safety_locked", False):
+            self._log("RISK_BREACH", f"下單安全鎖攔截：當前下單已鎖定，拒絕開立新倉 (欲進場: {reason})", price=raw_price)
+            return False
+
         entry_atr_val = entry_atr or {}
         slippage = self.strategy.execution.slippage_points
         cand_entry_price = raw_price + slippage if direction == 1 else raw_price - slippage
@@ -333,6 +366,7 @@ class PaperTradingEngine:
 
         slippage = self.strategy.execution.slippage_points
         fill_exit = raw_price - slippage if self.position.direction == 1 else raw_price + slippage
+        now_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         tr = self.core_engine._calc_trade_Record(
             direction=self.position.direction,
             contracts=self.position.contracts,
@@ -343,6 +377,8 @@ class PaperTradingEngine:
             reason=reason,
             cost_multiplier=1.0,
         )
+        tr.entry_time = getattr(self.position, "entry_time", "") or now_time_str
+        tr.exit_time = now_time_str
         self.closed_trades.append(tr)
         self.position = None
         return tr
@@ -592,6 +628,8 @@ class PaperTradingEngine:
             "daily_profit_locked": self.daily_profit_locked,
             "degradation_locked": self.degradation_locked,
             "credibility_verified": self.credibility_verified,
+            "order_safety_locked": getattr(self, "order_safety_locked", False),
+            "custom_tp_points": getattr(self, "custom_tp_points", 0.0),
             "daily_loss_baseline_pnl": getattr(self, "_daily_loss_baseline_pnl", 0.0),
             "initial_capital": self.initial_capital,
             "realized_pnl": self.realized_pnl,
@@ -617,6 +655,8 @@ class PaperTradingEngine:
             self.daily_profit_locked = data.get("daily_profit_locked", False)
             self.degradation_locked = data.get("degradation_locked", False)
             self.credibility_verified = data.get("credibility_verified", True)
+            self.order_safety_locked = data.get("order_safety_locked", False)
+            self.custom_tp_points = float(data.get("custom_tp_points", 0.0))
             self._daily_loss_baseline_pnl = float(data.get("daily_loss_baseline_pnl", 0.0))
             self.initial_capital = data.get("initial_capital", self.initial_capital)
 

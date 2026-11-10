@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 17
+    VERSION = 19
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -287,6 +287,17 @@ class TaishinQuoteFeed:
 
     def _append_tick(self, tick: TickData):
         with self.lock:
+            # 判別內外盤主動屬性 (1: 外盤買進紅, -1: 內盤賣出綠, 0: 中性)
+            if tick.side == 0 and self.latest_tick is not None:
+                if tick.price > self.latest_tick.price:
+                    tick.side = 1
+                elif tick.price < self.latest_tick.price:
+                    tick.side = -1
+                else:
+                    tick.side = getattr(self.latest_tick, "side", 1) or 1
+            elif tick.side == 0:
+                tick.side = 1
+
             self.latest_tick = tick
             self.raw_ticks.append(tick)
             if len(self.raw_ticks) > 5000:
@@ -316,6 +327,120 @@ class TaishinQuoteFeed:
                 cb(tick)
             except Exception as ex:
                 print(f"TaishinQuoteFeed: 外部回呼例外: {ex}")
+
+    def get_market_stats_summary(self) -> Dict[str, Any]:
+        """
+        計算當日/最新盤面關鍵統計指標：
+        開、高、低、昨收、總量、漲跌點、漲跌幅%、漲停價、跌停價、
+        Tick 流速 (tick/秒)、內外盤成交量佔比、最佳買賣價與點差。
+        """
+        with self.lock:
+            latest_tick = self.latest_tick
+            ticks = list(self.raw_ticks)
+            kbars = dict(self.kbars_1m)
+
+        curr_p = latest_tick.price if latest_tick else 0.0
+        now_dt = _now_tw()
+
+        # 1. 根據 K 棒判斷最新交易日並統計當日開高低與總量
+        if kbars:
+            latest_date = max(kbars.keys()).date()
+            # 篩選最新交易日的 K 棒（支援夜盤或跨日，以最新日期同日為主要當日統計）
+            today_bars = [b for dt, b in kbars.items() if dt.date() == latest_date]
+            today_bars.sort(key=lambda x: x["timestamp"])
+
+            # 找出前一交易日的收盤價
+            prev_bars = [b for dt, b in kbars.items() if dt.date() < latest_date]
+            if prev_bars:
+                prev_bars.sort(key=lambda x: x["timestamp"])
+                prev_close = float(prev_bars[-1]["close"])
+            elif len(today_bars) > 1:
+                prev_close = float(today_bars[0]["open"])
+            else:
+                prev_close = curr_p if curr_p > 0 else 1.0
+
+            if today_bars:
+                open_p = float(today_bars[0]["open"])
+                high_p = max(float(b["high"]) for b in today_bars)
+                low_p = min(float(b["low"]) for b in today_bars)
+                total_vol = sum(int(b["volume"]) for b in today_bars)
+                if curr_p <= 0:
+                    curr_p = float(today_bars[-1]["close"])
+            else:
+                open_p = high_p = low_p = curr_p
+                total_vol = 0
+        else:
+            open_p = high_p = low_p = curr_p
+            prev_close = curr_p if curr_p > 0 else 1.0
+            total_vol = 0
+
+        # 計算漲跌幅
+        change_val = round(curr_p - prev_close, 2) if prev_close > 0 else 0.0
+        change_pct = round((change_val / prev_close) * 100, 2) if prev_close > 0 else 0.0
+
+        # 漲跌停價 (台指期/個股預設 10%)
+        limit_up = round(prev_close * 1.10, 1)
+        limit_down = round(prev_close * 0.90, 1)
+
+        # 2. 計算 Tick 流速 (最近 10 秒內的 Tick 筆數 / 10 秒)
+        recent_10s_ticks = [
+            tk for tk in ticks
+            if (now_dt - tk.timestamp).total_seconds() <= 10
+        ]
+        ticks_per_sec = round(len(recent_10s_ticks) / 10.0, 1) if recent_10s_ticks else 0.0
+
+        # 3. 計算內外盤比 (取最近 100 筆 tick，若無即時 tick 則由最近 30 根分 K 漲跌量推算)
+        sample_ticks = ticks[-100:] if len(ticks) >= 100 else ticks
+        outer_vol = sum(int(tk.volume) for tk in sample_ticks if getattr(tk, "side", 0) == 1)
+        inner_vol = sum(int(tk.volume) for tk in sample_ticks if getattr(tk, "side", 0) == -1)
+        if (outer_vol + inner_vol) == 0 and kbars:
+            recent_kb = [kbars[k] for k in sorted(kbars.keys())[-30:]]
+            outer_vol = sum(int(b["volume"]) for b in recent_kb if float(b["close"]) >= float(b["open"]))
+            inner_vol = sum(int(b["volume"]) for b in recent_kb if float(b["close"]) < float(b["open"]))
+        sample_tot = outer_vol + inner_vol
+        if sample_tot > 0:
+            outer_ratio = round((outer_vol / sample_tot) * 100, 1)
+            inner_ratio = round((inner_vol / sample_tot) * 100, 1)
+        else:
+            outer_ratio = 50.0
+            inner_ratio = 50.0
+
+        # 4. 最佳買賣一價與點差
+        bid_p = getattr(latest_tick, "bid_price", 0.0) if latest_tick else 0.0
+        ask_p = getattr(latest_tick, "ask_price", 0.0) if latest_tick else 0.0
+        if bid_p <= 0 or ask_p <= 0:
+            # 若無實體掛單檔，以現價為基礎推估 1 檔微點差
+            bid_p = curr_p
+            ask_p = curr_p + 1.0 if curr_p > 1000 else curr_p + 0.5
+        spread = round(ask_p - bid_p, 1)
+
+        # 5. 計算與 20MA 均線成本乖離價差 (Basis)
+        if kbars:
+            recent_20 = [float(kbars[k]["close"]) for k in sorted(kbars.keys())[-20:]]
+            ma20_val = sum(recent_20) / len(recent_20)
+            basis_val = round(curr_p - ma20_val, 1)
+        else:
+            basis_val = 0.0
+
+        return {
+            "current_price": curr_p,
+            "open_p": open_p,
+            "high_p": high_p,
+            "low_p": low_p,
+            "prev_close": prev_close,
+            "total_vol": total_vol,
+            "change_val": change_val,
+            "change_pct": change_pct,
+            "limit_up": limit_up,
+            "limit_down": limit_down,
+            "ticks_per_sec": ticks_per_sec,
+            "outer_ratio": outer_ratio,
+            "inner_ratio": inner_ratio,
+            "bid_price": bid_p,
+            "ask_price": ask_p,
+            "spread": spread,
+            "basis_val": basis_val,
+        }
 
     def _fetch_solace_kbars_via_sol_d(self, symbol: str, lookback_days: int = 15) -> int:
         """
@@ -706,11 +831,22 @@ class TaishinQuoteFeed:
                                 pulled_live += 1
 
                     with self.lock:
-                        self.latest_tick = TickData(
+                        bid_q = float(front_q.get("CBidPrice1") or 0.0)
+                        ask_q = float(front_q.get("CAskPrice1") or 0.0)
+                        prev_p = self.latest_tick.price if self.latest_tick else last_p
+                        tk_side = 1 if last_p >= prev_p else -1
+                        new_tk = TickData(
                             timestamp=_now_tw(),
                             price=last_p,
-                            volume=int(float(front_q.get("CSingleVolume") or 1)),
+                            volume=max(1, int(float(front_q.get("CSingleVolume") or 1))),
+                            side=tk_side,
+                            bid_price=bid_q if bid_q > 0 else last_p,
+                            ask_price=ask_q if ask_q > 0 else (last_p + 1.0),
                         )
+                        self.latest_tick = new_tk
+                        self.raw_ticks.append(new_tk)
+                        if len(self.raw_ticks) > 5000:
+                            self.raw_ticks.pop(0)
                         source_name = f"台灣期交所官網 MIS 伺服器 ({sym_id})"
 
             with self.lock:
@@ -1062,7 +1198,28 @@ class TaishinQuoteFeed:
 
     def get_recent_ticks(self) -> List[TickData]:
         with self.lock:
-            return list(self.raw_ticks)
+            if len(self.raw_ticks) >= 5:
+                return list(self.raw_ticks)
+            ticks_copy = list(self.raw_ticks)
+            kbars_copy = [self.kbars_1m[k] for k in sorted(self.kbars_1m.keys())[-15:]] if self.kbars_1m else []
+        if not ticks_copy and kbars_copy:
+            synth: List[TickData] = []
+            prev_c = float(kbars_copy[0]["open"])
+            for b in kbars_copy:
+                c_p = float(b["close"])
+                o_p = float(b["open"])
+                s_val = 1 if c_p > o_p else (-1 if c_p < o_p else (1 if c_p >= prev_c else -1))
+                synth.append(
+                    TickData(
+                        timestamp=b["timestamp"],
+                        price=c_p,
+                        volume=max(1, int(b["volume"])),
+                        side=s_val,
+                    )
+                )
+                prev_c = c_p
+            return synth
+        return ticks_copy
 
     def clear_ticks(self):
         """清空 Tick 與 K 棒快取"""

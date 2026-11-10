@@ -150,3 +150,30 @@ def test_taishin_switch_symbol_clears_old_data_and_loads_new(tmp_path):
     assert bars_2317.height == 1
     assert bars_2317["close"][0] == 211.5
 
+
+def test_market_stats_summary_and_tick_velocity():
+    """測試當日開高低昨收、漲跌停、Tick 流速與內外盤力道計算"""
+    feed = TaishinQuoteFeed()
+    feed.symbol = "TMFR1"
+
+    t1 = datetime(2026, 11, 10, 9, 0, 0)
+    t2 = datetime(2026, 11, 10, 9, 1, 0)
+    feed.kbars_1m = {
+        t1: {"timestamp": t1, "open": 20000.0, "high": 20050.0, "low": 19980.0, "close": 20020.0, "volume": 100},
+        t2: {"timestamp": t2, "open": 20020.0, "high": 20100.0, "low": 20010.0, "close": 20080.0, "volume": 150},
+    }
+    # 模擬 2 筆 tick (一筆外盤 20080, 一筆內盤 20070)
+    feed._append_tick(TickData(timestamp=t2, price=20080.0, volume=5, side=1))
+    feed._append_tick(TickData(timestamp=t2, price=20070.0, volume=3, side=-1))
+
+    stats = feed.get_market_stats_summary()
+    assert stats["current_price"] == 20070.0
+    assert stats["open_p"] == 20000.0
+    assert stats["high_p"] == 20100.0
+    assert stats["low_p"] == 19980.0
+    assert stats["total_vol"] == 258  # 100 + 150 + 5 + 3
+    assert stats["outer_ratio"] > 0
+    assert stats["inner_ratio"] > 0
+    assert "ticks_per_sec" in stats
+    assert "spread" in stats
+

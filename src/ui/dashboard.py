@@ -6,11 +6,13 @@ import json
 import time
 import threading
 from pathlib import Path
+from typing import Optional
 import numpy as np
 import polars as pl
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from src.ai.advisor import FuturesAIAdvisor, FuturesAdvice
 from src.ai.cloud_intel import CloudIntelligenceHub, CloudIntelSnapshot
@@ -56,7 +58,10 @@ def mask_id_number(raw_id: str) -> str:
 
 def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
     """初始化並獲取全域紙上交易模擬引擎實例（自動從磁碟恢復狀態）"""
-    if "paper_trader" not in st.session_state:
+    if (
+        "paper_trader" not in st.session_state
+        or getattr(st.session_state["paper_trader"], "VERSION", None) != PaperTradingEngine.VERSION
+    ):
         # 預設採用微台 TMF 規格與預設順勢停損策略
         sym_key = symbol.split(" ")[0].upper()
         clean_key = "TMF" if "TMF" in sym_key else "MXF" if "MXF" in sym_key else "TXF" if "TXF" in sym_key else "TMF"
@@ -205,7 +210,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.5"
+APP_VERSION = "v2.7.9"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -247,7 +252,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-09 極速雲端版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-10 專業操盤戰情版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
 
     if is_idle_sleeping:
         st.warning("⏰【智慧防呆休眠中】您已連續看盤超過 30 分鐘。為保護雲端免費額度（確保 0 元），自動刷新已暫停。")
@@ -474,11 +479,47 @@ def main():
         bar_display_label = latest_1m_str
 
         st.markdown(f"""
-        <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
+        <div style="background-color: {sync_bg}; border: 1px solid {sync_border}; border-radius: 8px; padding: 8px 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: #e0e3eb;">
             <div><b>📡 伺服器同步狀態：</b><span style="color: {sync_border}; font-weight: 700;">{sync_badge}</span> &nbsp;|&nbsp; <b>{mkt_status_label}</b></div>
             <div>🕒 <b>伺服器最後更新時間：</b><span style="color: #40c4ff; font-weight: 700;">{sync_info['pull_time_str']} (台灣時間)</span> &nbsp;|&nbsp; 📊 <b>最新 K 棒時間：</b><span style="color: #f0b90b; font-weight: 700;">{bar_display_label}</span> &nbsp;|&nbsp; 🔗 <b>來源：</b>{sync_info['source']}</div>
         </div>
         """, unsafe_allow_html=True)
+
+        # ⚡ 頂部完整當日盤況與 Tick 流速遙測橫幅列（對齊專業期貨交易介面規格，禁止 4 空白縮排）
+        mkt_stats = feed.get_market_stats_summary()
+        p_chg = mkt_stats["change_val"]
+        p_pct = mkt_stats["change_pct"]
+        chg_color = "#ef5350" if p_chg > 0 else ("#26a69a" if p_chg < 0 else "#cfd8dc")
+        chg_sign = "+" if p_chg > 0 else ""
+        chg_arrow = "▲" if p_chg > 0 else ("▼" if p_chg < 0 else "—")
+        basis_v = mkt_stats.get("basis_val", 0.0)
+        basis_sign = "▲+" if basis_v > 0 else ("▼" if basis_v < 0 else "")
+        basis_col = "#ef5350" if basis_v > 0 else ("#26a69a" if basis_v < 0 else "#cfd8dc")
+
+        top_stats_html = (
+            '<div style="background: linear-gradient(90deg, #131722 0%, #1a233a 100%); border: 1px solid #2a2e39; border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; color: #d1d4dc;">'
+            '<div style="display: flex; align-items: baseline; gap: 10px;">'
+            f'<span style="font-size: 16px; font-weight: 700; color: #ffffff;">{ts_symbol}</span>'
+            f'<span style="font-size: 26px; font-weight: 800; color: {chg_color}; font-family: monospace;">{mkt_stats["current_price"]:,.1f}</span>'
+            f'<span style="font-size: 14px; font-weight: 700; color: {chg_color};">{chg_arrow} {chg_sign}{p_chg:,.1f} ({chg_sign}{p_pct:.2f}%)</span>'
+            '</div>'
+            '<div style="display: flex; gap: 15px; font-size: 13px; font-family: monospace; flex-wrap: wrap;">'
+            f'<div><span style="color: #787b86;">開</span> <b style="color: #e0e3eb;">{mkt_stats["open_p"]:,.1f}</b></div>'
+            f'<div><span style="color: #787b86;">高</span> <b style="color: #ef5350;">{mkt_stats["high_p"]:,.1f}</b></div>'
+            f'<div><span style="color: #787b86;">低</span> <b style="color: #26a69a;">{mkt_stats["low_p"]:,.1f}</b></div>'
+            f'<div><span style="color: #787b86;">昨收</span> <b style="color: #cfd8dc;">{mkt_stats["prev_close"]:,.1f}</b></div>'
+            f'<div><span style="color: #787b86;">總量</span> <b style="color: #f0b90b;">{mkt_stats["total_vol"]:,}</b></div>'
+            f'<div><span style="color: #ef5350;">漲停</span> <b style="color: #ef5350;">{mkt_stats["limit_up"]:,.1f}</b></div>'
+            f'<div><span style="color: #26a69a;">跌停</span> <b style="color: #26a69a;">{mkt_stats["limit_down"]:,.1f}</b></div>'
+            f'<div><span style="color: #787b86;">價差(20MA)</span> <b style="color: {basis_col};">{basis_sign}{basis_v:,.1f}</b></div>'
+            '</div>'
+            '<div style="display: flex; gap: 10px; align-items: center; font-size: 12.5px;">'
+            f'<div style="background: rgba(0,230,118,0.12); border: 1px solid #00e676; border-radius: 4px; padding: 2px 8px; color: #00e676;">⚡ 流速 <b>{mkt_stats["ticks_per_sec"]}</b> tick/秒</div>'
+            f'<div style="background: rgba(41,182,246,0.12); border: 1px solid #29b6f6; border-radius: 4px; padding: 2px 8px; color: #29b6f6;">📶 外盤 <b style="color:#ff5252;">{mkt_stats["outer_ratio"]}%</b> / 內盤 <b style="color:#00e676;">{mkt_stats["inner_ratio"]}%</b></div>'
+            '</div>'
+            '</div>'
+        )
+        st.markdown(top_stats_html, unsafe_allow_html=True)
 
         # 顏色主題與收盤休市狀態設定
         if not is_mkt_open:
@@ -700,7 +741,7 @@ def main():
         """, unsafe_allow_html=True)
 
         # 操盤控制按鈕與緊急平倉
-        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.3, 1.2, 1.5, 2.0])
+        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns([1.2, 1.2, 1.1, 1.1, 1.6])
         with ctrl_col1:
             if not pt.is_active:
                 if pt.daily_loss_locked or pt.kill_switch_locked or pt.degradation_locked:
@@ -726,50 +767,66 @@ def main():
                         st.info(flat_msg)
                     st.rerun()
         with ctrl_col2:
+            # 🔒 下單安全鎖 (對齊閃電下單安全鎖機制)
+            is_locked = getattr(pt, "order_safety_locked", False)
+            btn_lock_label = "🔒 下單已鎖定 (點此解鎖)" if is_locked else "⚡ 下單已解鎖 (點此鎖定)"
+            btn_lock_type = "secondary" if is_locked else "primary"
+            if st.button(btn_lock_label, key="btn_toggle_order_lock", type=btn_lock_type, help="鎖定時僅能執行平倉與風控，嚴格禁止開立新倉"):
+                pt.order_safety_locked = not is_locked
+                pt.save_state_to_disk()
+                st.rerun()
+        with ctrl_col3:
             if st.button("🚨 一鍵緊急平倉 (Kill)", key="btn_kill_switch", help="立即市價平掉所有部位並鎖定系統"):
                 kill_msg = pt.trigger_kill_switch(current_price=tmf_curr_p)
                 pt.save_state_to_disk()
                 st.warning(kill_msg)
                 st.rerun()
-        with ctrl_col3:
-            if pt.kill_switch_locked or pt.daily_loss_locked or pt.degradation_locked:
-                if st.button("🔓 僅解除風控鎖定", key="btn_unlock_risk", help="僅解除鎖定狀態，暫不自動啟動下單"):
-                    pt.reset_risk_locks(reset_daily_accounting=True)
-                    pt.save_state_to_disk()
-                    st.rerun()
-            else:
-                st.caption("🟢 系統運行中 / 風控正常")
         with ctrl_col4:
-            st.caption(f"🛡️ 嚴格風控：單日虧損上限 -{pt.risk_config.max_daily_loss:,.0f} 元 ｜ 連續 4 筆虧損強制休眠 ｜ 2倍ATR動態停損")
+            if st.button("🧹 全部模擬重置 (回10萬)", key="btn_reset_all_sim", help="清空所有持倉、歷史成交紀錄與損益，將虛擬總權益恢復為初始 100,000 元"):
+                pt.reset_all_simulation(initial_capital=100_000.0)
+                st.toast("🔄 模擬帳戶已完全重置，本金恢復 100,000 元！", icon="🧹")
+                st.rerun()
+        with ctrl_col5:
+            st.caption(f"🛡️ 風控：單日虧損上限 -{pt.risk_config.max_daily_loss:,.0f} 元 ｜ 連虧4筆休眠 ｜ 上限 {pt.risk_config.max_contracts} 口")
 
-        with st.expander("⚙️ 點擊自訂個人操盤策略（固定停損／移動停利／單日虧損風控）"):
-            sc1, sc2, sc3, sc4, sc5 = st.columns([1.2, 1.2, 1.2, 1.3, 1.0])
+        with st.expander("⚙️ 點擊自訂個人操盤策略（下單口數／固定停利／防守止損／移動鎖利／單日虧損上限）"):
+            sc1, sc2, sc3, sc4, sc5, sc6 = st.columns([1.0, 1.0, 1.0, 0.9, 1.1, 0.9])
             with sc1:
                 cur_sl = pt.strategy.exit.stop_loss.value if pt.strategy.exit.stop_loss and pt.strategy.exit.stop_loss.value else 45.0
-                new_sl = st.number_input("防守止損點數 (點)", min_value=10.0, max_value=300.0, value=float(cur_sl), step=5.0, help="進場後價格反向虧損達此點數，立即市價停損")
+                safe_sl = min(max(float(cur_sl), 10.0), 300.0)
+                new_sl = st.number_input("防守止損 (點)", min_value=10.0, max_value=300.0, value=safe_sl, step=5.0, help="進場後價格反向虧損達此點數，立即市價停損")
             with sc2:
-                cur_tp = pt.strategy.exit.take_profit.value if pt.strategy.exit.take_profit and pt.strategy.exit.take_profit.value else 0.0
-                new_tp = st.number_input("固定停利點數 (0=不限制)", min_value=0.0, max_value=500.0, value=float(cur_tp), step=10.0, help="獲利達到此點數自動平倉入袋，0 代表依靠移動停利或訊號離場")
+                cur_tp = getattr(pt, "custom_tp_points", 0.0)
+                safe_tp = min(max(float(cur_tp), 0.0), 500.0)
+                new_tp = st.number_input("自動停利 (點, 0=依策略)", min_value=0.0, max_value=500.0, value=safe_tp, step=10.0, help="設定大於 0 時，新倉進場後自動掛出對應固定點數停利")
             with sc3:
                 cur_ts = pt.strategy.exit.trailing_stop.value if pt.strategy.exit.trailing_stop else 30.0
-                new_ts = st.number_input("移動回檔鎖利 (點)", min_value=10.0, max_value=200.0, value=float(cur_ts), step=5.0, help="獲利自波段最高點回檔超過此點數，自動出場保住利潤")
+                safe_ts = min(max(float(cur_ts), 10.0), 200.0)
+                new_ts = st.number_input("移動回檔鎖利 (點)", min_value=10.0, max_value=200.0, value=safe_ts, step=5.0, help="獲利自波段最高點回檔超過此點數，自動出場保住利潤")
             with sc4:
-                cur_daily_loss = pt.risk_config.max_daily_loss
-                new_daily_loss = st.number_input("單日最大虧損上限 (元)", min_value=1000.0, max_value=50000.0, value=float(cur_daily_loss), step=500.0, help="當日累積虧損達到此金額時，強制停止當日所有交易")
+                cur_max_c = pt.risk_config.max_contracts
+                safe_max_c = min(max(int(cur_max_c), 1), 10)
+                new_max_c = st.number_input("持倉上限 (口)", min_value=1, max_value=10, value=safe_max_c, step=1, help="最大允許持倉口數")
             with sc5:
+                cur_daily_loss = pt.risk_config.max_daily_loss
+                safe_daily_loss = min(max(float(cur_daily_loss), 500.0), 50000.0)
+                new_daily_loss = st.number_input("單日最大虧損上限 (元)", min_value=500.0, max_value=50000.0, value=safe_daily_loss, step=500.0, help="當日累積虧損達到此金額時，強制停止當日所有交易")
+            with sc6:
                 st.write("")
                 st.write("")
-                if st.button("💾 儲存策略設定", key="btn_save_user_strategy", type="secondary"):
+                if st.button("💾 儲存設定", key="btn_save_user_strategy", type="secondary"):
                     from src.schema.strategy import StopLossSpec, TrailingStopSpec
                     pt.strategy.exit.stop_loss = StopLossSpec(type="fixed_points", value=float(new_sl))
+                    pt.custom_tp_points = float(new_tp)
                     if new_tp > 0:
                         pt.strategy.exit.take_profit = StopLossSpec(type="fixed_points", value=float(new_tp))
                     else:
                         pt.strategy.exit.take_profit = None
                     pt.strategy.exit.trailing_stop = TrailingStopSpec(type="points", value=float(new_ts), activation_points=float(new_ts))
+                    pt.risk_config.max_contracts = int(new_max_c)
                     pt.risk_config.max_daily_loss = float(new_daily_loss)
                     pt.save_state_to_disk()
-                    st.success("✅ 策略參數已即時套用並儲存！")
+                    st.success("✅ 策略參數與口數上限已即時套用儲存！")
                     st.rerun()
 
         with st.expander("📋 展開檢視：AI 模擬操盤交易明細與風控稽核日誌"):
@@ -806,7 +863,7 @@ def main():
         k_top1, k_top2, k_top3 = st.columns([2.3, 1.0, 0.9])
         with k_top1:
             if is_mkt_open:
-                st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與布林通道 / AI 預估圖")
+                st.subheader(f"📈 {ts_symbol} — {chart_tf} 即時 K 線與量價決策戰情圖")
             else:
                 st.subheader(f"📈 {ts_symbol} — {chart_tf} 收盤 K 線圖（{mkt_status_label}）")
         with k_top2:
@@ -827,6 +884,7 @@ def main():
             df_plot["time_label"] = df_plot["timestamp"].dt.strftime("%m-%d %H:%M")
             df_plot["ma5"] = df_plot["close"].rolling(5).mean()
             df_plot["ma20"] = df_plot["close"].rolling(20).mean()
+            df_plot["ma60"] = df_plot["close"].rolling(60).mean()
             bb_std_s = df_plot["close"].rolling(20).std().fillna(0.0)
             df_plot["bb_up"] = df_plot["ma20"] + 2.0 * bb_std_s
             df_plot["bb_low"] = df_plot["ma20"] - 2.0 * bb_std_s
@@ -843,13 +901,46 @@ def main():
             init_start = max(0, total_k - vis_count)
 
             last_close = float(df_plot["close"].iloc[-1])
+            last_open = float(df_plot["open"].iloc[-1])
+            last_high = float(df_plot["high"].iloc[-1])
+            last_low = float(df_plot["low"].iloc[-1])
+            last_vol = int(df_plot["volume"].iloc[-1])
             last_label = str(df_plot["time_label"].iloc[-1])
+            last_ma5 = float(df_plot["ma5"].iloc[-1]) if pd.notna(df_plot["ma5"].iloc[-1]) else last_close
+            last_ma20 = float(df_plot["ma20"].iloc[-1]) if pd.notna(df_plot["ma20"].iloc[-1]) else last_close
+            last_ma60 = float(df_plot["ma60"].iloc[-1]) if pd.notna(df_plot["ma60"].iloc[-1]) else last_close
             recent_bar_atr = float((df_plot["high"].tail(14) - df_plot["low"].tail(14)).mean())
             eff_atr = (
                 float(advice.atr_val)
                 if getattr(advice, "atr_val", 0.0) > 0
                 else max(12.0 if is_fut else 0.5, recent_bar_atr)
             )
+
+            # 買賣膠囊與均線狀態帶 (對齊截圖左上角「買進 42,267 | 1 | 42,271 賣出」與「開高低收量 + MA5/20/60」，無前導縮排)
+            bid_v = mkt_stats.get("bid_price", last_close)
+            ask_v = mkt_stats.get("ask_price", last_close + 1.0)
+            spd_v = mkt_stats.get("spread", 1.0)
+
+            chart_header_html = (
+                '<div style="background: rgba(19, 23, 34, 0.95); border: 1px solid #2a2e39; border-radius: 6px; padding: 6px 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; font-family: monospace; font-size: 13px;">'
+                '<div style="display: flex; align-items: center; gap: 6px;">'
+                f'<div style="background: #26a69a; color: #ffffff; padding: 2px 10px; border-radius: 4px; font-weight: 700;">買進 {bid_v:,.0f}</div>'
+                f'<div style="background: #1e222d; color: #29b6f6; padding: 2px 8px; border-radius: 4px; border: 1px solid #2a2e39; font-weight: 700;">{spd_v:,.0f}</div>'
+                f'<div style="background: #ef5350; color: #ffffff; padding: 2px 10px; border-radius: 4px; font-weight: 700;">賣出 {ask_v:,.0f}</div>'
+                '</div>'
+                '<div style="display: flex; gap: 10px; color: #d1d4dc; font-size: 12.5px; flex-wrap: wrap;">'
+                f'<span>開 <b style="color:#ffffff;">{last_open:,.1f}</b></span>'
+                f'<span>高 <b style="color:#ef5350;">{last_high:,.1f}</b></span>'
+                f'<span>低 <b style="color:#26a69a;">{last_low:,.1f}</b></span>'
+                f'<span>收 <b style="color:#ffffff;">{last_close:,.1f}</b></span>'
+                f'<span>量 <b style="color:#f0b90b;">{last_vol:,}</b></span>'
+                f'<span style="color: #ffa726;">MA5 <b>{last_ma5:,.1f}</b></span>'
+                f'<span style="color: #29b6f6;">MA20 <b>{last_ma20:,.1f}</b></span>'
+                f'<span style="color: #ba68c8;">MA60 <b>{last_ma60:,.1f}</b></span>'
+                '</div>'
+                '</div>'
+            )
+            st.markdown(chart_header_html, unsafe_allow_html=True)
 
             # 提取 AI 預估關鍵價位 (進場、停損、目標，已由 ATR 與布林通道雙重收斂校準)
             ai_levels = advice.extract_price_levels(fallback_price=last_close)
@@ -926,7 +1017,15 @@ def main():
             ref_start_idx = max(init_start, total_k - 35)
             ref_x = list(df_plot["time_label"].iloc[ref_start_idx:]) + future_labels
 
-            fig_k = go.Figure()
+            fig_k = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+                row_heights=[0.78, 0.22],
+            )
+
+            # 主圖：K 線圖
             fig_k.add_trace(go.Candlestick(
                 x=df_plot["time_label"],
                 open=df_plot["open"],
@@ -936,31 +1035,37 @@ def main():
                 increasing_line_color="#ef5350",
                 decreasing_line_color="#26a69a",
                 name="K線",
-            ))
+            ), row=1, col=1)
             fig_k.add_trace(go.Scatter(
                 x=df_plot["time_label"],
                 y=df_plot["ma5"],
                 line=dict(color="#ffa726", width=1.6),
                 name="5MA",
-            ))
+            ), row=1, col=1)
             fig_k.add_trace(go.Scatter(
                 x=df_plot["time_label"],
                 y=df_plot["ma20"],
                 line=dict(color="#29b6f6", width=1.6),
                 name="20MA(中軸成本)",
-            ))
+            ), row=1, col=1)
+            fig_k.add_trace(go.Scatter(
+                x=df_plot["time_label"],
+                y=df_plot["ma60"],
+                line=dict(color="#ba68c8", width=1.5),
+                name="60MA(季線/趨勢)",
+            ), row=1, col=1)
             fig_k.add_trace(go.Scatter(
                 x=df_plot["time_label"],
                 y=df_plot["bb_up"],
                 line=dict(color="rgba(186, 104, 200, 0.65)", width=1.2, dash="dot"),
                 name="布林上軌(2σ壓力)",
-            ))
+            ), row=1, col=1)
             fig_k.add_trace(go.Scatter(
                 x=df_plot["time_label"],
                 y=df_plot["bb_low"],
                 line=dict(color="rgba(186, 104, 200, 0.65)", width=1.2, dash="dot"),
                 name="布林下軌(2σ支撐)",
-            ))
+            ), row=1, col=1)
 
             # 僅在「開盤交易中 (is_mkt_open == True)」時繪製 AI 預估未來走勢軌跡線與目標/停損線；收盤停止交易時自動隱藏！
             if is_mkt_open:
@@ -971,7 +1076,7 @@ def main():
                     line=dict(color=proj_color, width=2.6, dash="dash"),
                     marker=dict(size=6, color=proj_color, symbol="diamond"),
                     name=proj_name,
-                ))
+                ), row=1, col=1)
 
                 if target_val > 0:
                     tp_lbl = f"🏆 布林/短線目標 ({target_val:,.1f})" if advice.action != "WAIT" else f"🔼 突破做多觸發線 ({target_val:,.1f})"
@@ -981,7 +1086,7 @@ def main():
                         mode="lines",
                         line=dict(color="#00e676", width=1.4, dash="dot"),
                         name=tp_lbl,
-                    ))
+                    ), row=1, col=1)
                 if advice.action != "WAIT" and entry_val > 0:
                     fig_k.add_trace(go.Scatter(
                         x=ref_x,
@@ -989,7 +1094,7 @@ def main():
                         mode="lines",
                         line=dict(color="#40c4ff", width=1.3, dash="dashdot"),
                         name=f"🎯 參考進場 ({entry_val:,.1f})",
-                    ))
+                    ), row=1, col=1)
                 if stop_val > 0:
                     sl_lbl = f"🛑 防守停損 ({stop_val:,.1f})" if advice.action != "WAIT" else f"🔽 跌破做空觸發線 ({stop_val:,.1f})"
                     fig_k.add_trace(go.Scatter(
@@ -998,7 +1103,7 @@ def main():
                         mode="lines",
                         line=dict(color="#ff5252", width=1.4, dash="dot"),
                         name=sl_lbl,
-                    ))
+                    ), row=1, col=1)
 
                 fig_k.add_annotation(
                     x=future_labels[-1],
@@ -1009,14 +1114,111 @@ def main():
                     arrowsize=1,
                     arrowwidth=1.5,
                     arrowcolor=proj_color,
-                    ax=-26,  # 稍微向左偏置，徹底杜絕文字框被畫布右邊緣切掉
+                    ax=-26,
                     ay=-28 if advice.action != "SELL_SHORT" else 28,
                     font=dict(color="#ffffff", size=11.5),
                     bgcolor="rgba(20, 24, 35, 0.88)",
                     bordercolor=proj_color,
                     borderwidth=1,
                     borderpad=4,
+                    row=1,
+                    col=1,
                 )
+
+            # 🎯 K 線買賣進出場標記點位（對齊截圖中的「▲ 進買1 @ 42,234」與「▼ 出賣1 @ 42,349」，支援 1m/5m/15m/30m/60m 自動吸附對應 K 棒）
+            def _resolve_chart_x_label(raw_t: str) -> Optional[str]:
+                if not raw_t:
+                    return None
+                lbl_11 = raw_t[-11:] if len(raw_t) >= 11 else raw_t
+                if lbl_11 in set(df_plot["time_label"]):
+                    return lbl_11
+                try:
+                    dt_parsed = pd.to_datetime(raw_t[:16])
+                    matched = df_plot[df_plot["timestamp"] <= dt_parsed]
+                    if not matched.empty:
+                        last_match_dt = matched["timestamp"].iloc[-1]
+                        if abs((dt_parsed - last_match_dt).total_seconds()) <= 3600:
+                            return str(matched["time_label"].iloc[-1])
+                except Exception:
+                    pass
+                return None
+
+            if is_fut:
+                # 1. 標註已平倉交易
+                for tr in (pt.closed_trades[-12:] if pt.closed_trades else []):
+                    e_lbl = _resolve_chart_x_label(tr.entry_time)
+                    x_lbl = _resolve_chart_x_label(tr.exit_time)
+                    if e_lbl:
+                        arr_color = "#ef5350" if tr.direction == 1 else "#26a69a"
+                        arr_text = f"▲ 進買{tr.contracts} @ {tr.entry_price:,.0f}" if tr.direction == 1 else f"▼ 進空{tr.contracts} @ {tr.entry_price:,.0f}"
+                        fig_k.add_annotation(
+                            x=e_lbl,
+                            y=tr.entry_price,
+                            text=arr_text,
+                            showarrow=True,
+                            arrowhead=2,
+                            arrowcolor=arr_color,
+                            ay=32 if tr.direction == 1 else -32,
+                            font=dict(color="#ffffff", size=10.5),
+                            bgcolor="rgba(19, 23, 34, 0.9)",
+                            bordercolor=arr_color,
+                            borderwidth=1,
+                            row=1,
+                            col=1,
+                        )
+                    if x_lbl:
+                        x_color = "#00e676" if tr.net_pnl > 0 else "#ff5252"
+                        x_text = f"▼ 出賣{tr.contracts} @ {tr.exit_price:,.0f}" if tr.direction == 1 else f"▲ 出買{tr.contracts} @ {tr.exit_price:,.0f}"
+                        fig_k.add_annotation(
+                            x=x_lbl,
+                            y=tr.exit_price,
+                            text=f"{x_text} ({tr.net_pnl:+,.0f})",
+                            showarrow=True,
+                            arrowhead=2,
+                            arrowcolor=x_color,
+                            ay=-32 if tr.direction == 1 else 32,
+                            font=dict(color="#ffffff", size=10),
+                            bgcolor="rgba(19, 23, 34, 0.9)",
+                            bordercolor=x_color,
+                            borderwidth=1,
+                            row=1,
+                            col=1,
+                        )
+                # 2. 標註當前持倉進場點
+                if pt.position is not None:
+                    pos_lbl = _resolve_chart_x_label(pt.position.entry_time) or last_label
+                    p_color = "#ef5350" if pt.position.direction == 1 else "#26a69a"
+                    p_text = f"▲ 進買{pt.position.contracts} @ {pt.position.entry_price:,.0f}" if pt.position.direction == 1 else f"▼ 進賣{pt.position.contracts} @ {pt.position.entry_price:,.0f}"
+                    fig_k.add_annotation(
+                        x=pos_lbl,
+                        y=pt.position.entry_price,
+                        text=p_text,
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowcolor=p_color,
+                        ay=35 if pt.position.direction == 1 else -35,
+                        font=dict(color="#ffffff", size=11, family="Roboto Mono"),
+                        bgcolor=p_color,
+                        bordercolor="#ffffff",
+                        borderwidth=1,
+                        row=1,
+                        col=1,
+                    )
+
+            # 副圖：紅綠成交量柱狀圖 (Row 2，補齊未來預估空白格以確保上下子圖 X 軸類別座標 100% 同步對齊)
+            vol_x = list(df_plot["time_label"]) + (future_labels if is_mkt_open else [])
+            vol_y = list(df_plot["volume"]) + ([0] * len(future_labels) if is_mkt_open else [])
+            vol_colors = [
+                "rgba(239, 83, 80, 0.75)" if c >= o else "rgba(38, 166, 154, 0.75)"
+                for o, c in zip(df_plot["open"], df_plot["close"])
+            ] + (["rgba(0,0,0,0)"] * len(future_labels) if is_mkt_open else [])
+            fig_k.add_trace(go.Bar(
+                x=vol_x,
+                y=vol_y,
+                marker_color=vol_colors,
+                name="成交量",
+                showlegend=False,
+            ), row=2, col=1)
 
             # 由最後一根最新 K 棒 (total_k - 1) 往回取固定間距刻度，確保最新 K 棒時間 100% 顯示在 X 軸上絕不跳格！
             # 關鍵防重疊：未來預估僅顯示終點「AI預估+5」，移除「+2」，徹底消除與最新時間擠在一起的斜放重疊！
@@ -1030,25 +1232,32 @@ def main():
                 explicit_tickvals = [all_time_labels[idx] for idx in tick_indices]
                 x_max_range = total_k - 0.2
 
+            shared_x_cfg = dict(
+                type="category",
+                tickmode="array",
+                tickvals=explicit_tickvals,
+                ticktext=explicit_tickvals,
+                range=[init_start - 0.5, x_max_range],
+                minallowed=-0.5,
+                maxallowed=x_max_range + 1.2,
+            )
+
             fig_k.update_layout(
                 template="plotly_dark",
-                height=520,
-                margin=dict(l=15, r=60, t=80, b=25),  # 頂部增高至 80px，右側加寬至 60px，徹底杜絕標籤被切與頂部按鈕遮擋
+                height=580,
+                margin=dict(l=15, r=60, t=80, b=25),
                 xaxis_rangeslider_visible=False,
-                xaxis=dict(
-                    type="category",
-                    tickmode="array",
-                    tickvals=explicit_tickvals,
-                    ticktext=explicit_tickvals,
-                    range=[init_start - 0.5, x_max_range],
-                    minallowed=-0.5,
-                    maxallowed=x_max_range + 1.2,
-                ),
+                xaxis=dict(**shared_x_cfg, showticklabels=False),
+                xaxis2=dict(**shared_x_cfg, showticklabels=True),
                 yaxis=dict(
                     range=[y_min - y_pad, y_max + y_pad],
                     fixedrange=False,
                 ),
-                # 圖例置於圖表正上方左側，並與右上角相機工具列徹底分開
+                yaxis2=dict(
+                    title="量",
+                    showgrid=False,
+                    fixedrange=False,
+                ),
                 legend=dict(
                     orientation="h",
                     yanchor="bottom",
@@ -1070,18 +1279,151 @@ def main():
         else:
             st.info(f"💡 目前尚無 `{ts_symbol}` 的 K 線數據。請點擊右上方「🚀 連線 / 重新 AI 分析」按鈕載入台新真實 K 線。")
 
-        # 最新逐筆成交明細（收合或精簡展示）
-        recent_ticks = feed.get_recent_ticks()
-        if recent_ticks:
-            with st.expander(f"⚡ 檢視最新逐筆成交明細 (最近 {min(15, len(recent_ticks))} 筆)", expanded=False):
-                tick_rows = [
-                    {
-                        "成交時間": tk.timestamp.strftime("%H:%M:%S"),
-                        "成交價": f"{tk.price:,.1f}",
-                        "單筆數量": tk.volume,
-                    }
-                    for tk in reversed(recent_ticks[-15:])
-                ]
-                st.dataframe(pd.DataFrame(tick_rows), width="stretch", height=180)
+        # ==================== 底部三合一專業資訊艙 (對齊專業閃電交易介面，無 4 空白縮排) ====================
+        st.markdown("---")
+        bot_col1, bot_col2, bot_col3 = st.columns([1.5, 1.2, 1.3])
+
+        with bot_col1:
+            st.markdown("##### 📑 委託 / 成交")
+            filter_mode = st.radio(
+                "委託篩選",
+                ["全部", "已成交", "持倉中", "風控攔截"],
+                index=0,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="order_filter_radio",
+            )
+            order_rows = []
+            if filter_mode in ["全部", "持倉中"] and pt.position is not None:
+                p_dir = "買" if pt.position.direction == 1 else "賣"
+                order_rows.append({
+                    "時間": pt.position.entry_time[-8:] if len(pt.position.entry_time) >= 8 else pt.position.entry_time,
+                    "買賣": p_dir,
+                    "口數": pt.position.contracts,
+                    "成交": f"{pt.position.contracts} @ {pt.position.entry_price:,.0f}",
+                    "條件": "IOC",
+                    "狀態": "🟢 持倉中",
+                })
+                if pt.position.take_profit_price:
+                    tp_dir = "賣" if pt.position.direction == 1 else "買"
+                    order_rows.append({
+                        "時間": pt.position.entry_time[-8:] if len(pt.position.entry_time) >= 8 else "--",
+                        "買賣": tp_dir,
+                        "口數": pt.position.contracts,
+                        "成交": f"停利 @ {pt.position.take_profit_price:,.0f}",
+                        "條件": "ROD",
+                        "狀態": "⏳ 自動停利掛單",
+                    })
+
+            if filter_mode in ["全部", "已成交"]:
+                for tr in reversed(pt.closed_trades[-12:] if pt.closed_trades else []):
+                    exit_dir = "賣" if tr.direction == 1 else "買"
+                    entry_dir = "買" if tr.direction == 1 else "賣"
+                    order_rows.append({
+                        "時間": tr.exit_time[-8:] if len(tr.exit_time) >= 8 else "--",
+                        "買賣": exit_dir,
+                        "口數": tr.contracts,
+                        "成交": f"{tr.contracts} @ {tr.exit_price:,.0f} ({tr.net_pnl:+,.0f}元)",
+                        "條件": "IOC",
+                        "狀態": "✅ 全部成交",
+                    })
+                    order_rows.append({
+                        "時間": tr.entry_time[-8:] if len(tr.entry_time) >= 8 else "--",
+                        "買賣": entry_dir,
+                        "口數": tr.contracts,
+                        "成交": f"{tr.contracts} @ {tr.entry_price:,.0f}",
+                        "條件": "IOC",
+                        "狀態": "✅ 全部成交",
+                    })
+
+            if filter_mode in ["全部", "風控攔截"]:
+                for l in reversed(pt.audit_logs[-15:] if pt.audit_logs else []):
+                    if l.event_type in ["RISK_BREACH", "KILL_SWITCH"]:
+                        order_rows.append({
+                            "時間": l.timestamp[-8:],
+                            "買賣": "系統",
+                            "口數": 1,
+                            "成交": f"{l.price:,.0f}" if l.price else "--",
+                            "條件": "FOK",
+                            "狀態": "🛑 風控攔截",
+                        })
+
+            if order_rows:
+                st.dataframe(pd.DataFrame(order_rows), width="stretch", height=225, hide_index=True)
+            else:
+                st.caption(f"目前無『{filter_mode}』相關紀錄")
+
+        with bot_col2:
+            st.markdown("##### ⚡ 成交明細 (Time & Sales)")
+            out_r = mkt_stats.get("outer_ratio", 50.0)
+            in_r = mkt_stats.get("inner_ratio", 50.0)
+            ratio_bar_html = (
+                '<div style="margin-bottom: 6px; font-size: 11.5px; font-family: monospace;">'
+                '<div style="display: flex; justify-content: space-between; margin-bottom: 2px;">'
+                f'<span style="color: #ff5252; font-weight: 700;">外盤買進 {out_r:.0f}%</span>'
+                f'<span style="color: #00e676; font-weight: 700;">內盤賣出 {in_r:.0f}%</span>'
+                '</div>'
+                '<div style="width: 100%; height: 6px; background: #00e676; border-radius: 3px; overflow: hidden;">'
+                f'<div style="width: {out_r}%; height: 100%; background: #ff5252;"></div>'
+                '</div>'
+                '</div>'
+            )
+            recent_ticks = feed.get_recent_ticks()
+            if recent_ticks:
+                t_list_html = []
+                for tk in reversed(recent_ticks[-15:]):
+                    t_ms = tk.timestamp.strftime("%H:%M:%S") + f".{tk.timestamp.microsecond // 1000:03d}"
+                    tk_side = getattr(tk, "side", 0)
+                    t_color = "#ff5252" if tk_side == 1 else ("#00e676" if tk_side == -1 else "#ffffff")
+                    side_tag = "外" if tk_side == 1 else ("內" if tk_side == -1 else "—")
+                    t_list_html.append(
+                        '<div style="display: flex; justify-content: space-between; padding: 2px 4px; font-family: monospace; font-size: 12.5px; border-bottom: 1px solid rgba(255,255,255,0.05);">'
+                        f'<span style="color: #787b86;">{t_ms}</span>'
+                        f'<span style="color: {t_color}; font-weight: 700;">{tk.price:,.1f} <small>({side_tag})</small></span>'
+                        f'<span style="color: {t_color}; font-weight: 700;">{tk.volume}</span>'
+                        '</div>'
+                    )
+                all_t_html = "".join(t_list_html)
+                ts_box_html = (
+                    f'{ratio_bar_html}'
+                    f'<div style="background: #131722; border: 1px solid #2a2e39; border-radius: 6px; padding: 6px; height: 195px; overflow-y: auto;">{all_t_html}</div>'
+                )
+                st.markdown(ts_box_html, unsafe_allow_html=True)
+            else:
+                st.markdown(ratio_bar_html, unsafe_allow_html=True)
+                st.caption("等待即時 Tick 成交中...")
+
+        with bot_col3:
+            st.markdown("##### 🖥️ 系統訊息 (Execution Log)")
+            sys_logs = []
+            if pt.position is not None and pt.position.take_profit_price:
+                tp_pts = abs(pt.position.take_profit_price - pt.position.entry_price)
+                tp_side = "賣" if pt.position.direction == 1 else "買"
+                sys_logs.append(
+                    '<div style="padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 12px; font-family: monospace;">'
+                    f'<span style="color: #787b86;">{pt.position.entry_time[-8:]}</span> '
+                    '<span style="color: #f0b90b; font-weight: 700;">[自動停利]</span> '
+                    f'<span style="color: #cfd8dc;">掛出 {tp_side} {pt.position.contracts} 口 @ {pt.position.take_profit_price:,.0f} (成交價 +{tp_pts:.0f}點)</span>'
+                    '</div>'
+                )
+            if pt.audit_logs:
+                for l in reversed(pt.audit_logs[-20:]):
+                    t_short = l.timestamp[-8:]
+                    ev = l.event_type
+                    ev_zh = "模擬成交" if ev == "ORDER_FILL" else ("風控停損" if ev == "STOP_OUT" else ("風控攔截" if ev == "RISK_BREACH" else ev))
+                    ev_color = "#00e676" if ev == "ORDER_FILL" else ("#ff5252" if ev in ["RISK_BREACH", "STOP_OUT"] else "#40c4ff")
+                    sys_logs.append(
+                        '<div style="padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 12px; font-family: monospace;">'
+                        f'<span style="color: #787b86;">{t_short}</span> '
+                        f'<span style="color: {ev_color}; font-weight: 700;">[{ev_zh}]</span> '
+                        f'<span style="color: #cfd8dc;">{l.message}</span>'
+                        '</div>'
+                    )
+            else:
+                sys_logs.append('<div style="color: #787b86; font-size: 12px; font-family: monospace;">[系統初始化完成，已載入台新與期交所即時 K 棒...]</div>')
+
+            all_sys_html = "".join(sys_logs)
+            sys_box_html = f'<div style="background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px; height: 225px; overflow-y: auto;">{all_sys_html}</div>'
+            st.markdown(sys_box_html, unsafe_allow_html=True)
 
     _render_unified_war_room()

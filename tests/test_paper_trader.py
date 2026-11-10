@@ -129,3 +129,14 @@ def test_paper_trading_daily_max_loss_lock():
     assert not pt.is_active
     assert pt.position is None
     assert len(pt.closed_trades) == 1
+
+    # 測試全部模擬重置：清空所有歷史成交、風控鎖定，本金恢復 100,000 元 (save_to_disk=False 避免單元測試污染正式存檔)
+    pt.reset_all_simulation(initial_capital=100_000.0, save_to_disk=False)
+    assert pt.initial_capital == 100_000.0
+    assert pt.realized_pnl == 0.0
+    assert pt.get_total_equity() == 100_000.0
+    assert pt.position is None
+    assert len(pt.closed_trades) == 0
+    assert not pt.daily_loss_locked
+    assert not pt.kill_switch_locked
+    assert not pt.order_safety_locked
