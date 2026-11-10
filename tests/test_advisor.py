@@ -181,16 +181,29 @@ def test_chat_with_advisor_qa_and_commands():
     assert "布林通道邊界" in ans_levels
     assert "42,655.0" in ans_levels
 
-    # 2. 詢問為什麼沒交易
+    # 2. 詢問為什麼沒交易與傳入模擬帳戶測試正則指令解析 (確保 import re 100% 正常運作)
+    from types import SimpleNamespace
+    dummy_pt = SimpleNamespace(
+        position=None,
+        closed_trades=[],
+        realized_pnl=0.0,
+        custom_tp_points=40.0,
+        risk_config=SimpleNamespace(max_daily_loss=1500.0),
+        get_total_equity=lambda p: 100000.0,
+        get_unrealized_pnl=lambda p: 0.0,
+        save_state_to_disk=lambda: None,
+    )
     ans_wait = FuturesAIAdvisor.chat_with_advisor(
-        user_msg="為什麼現在沒有交易？",
+        user_msg="把停利改成 55 點，順便告訴我為什麼現在沒有交易？",
         symbol="TMFR1",
         timeframe="5m",
         current_price=42655.0,
         advice=advice,
+        paper_trader=dummy_pt,
         gemini_api_key="",
     )
-    assert "TMFR1" in ans_wait or "AI" in ans_wait
+    assert dummy_pt.custom_tp_points == 55.0
+    assert "55" in ans_wait
 
 
 

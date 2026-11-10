@@ -1,6 +1,7 @@
 # src/ai/advisor.py
 from __future__ import annotations
 import os
+import re
 import json
 import time
 import requests
@@ -402,11 +403,22 @@ class FuturesAIAdvisor:
         bb_width = (bb_span / max(1.0, ma20)) * 100.0 if ma20 > 0 else 1.0
         regime = MarketRegimeDetector.detect_regime_at(adx_val, bb_width)
 
-        # 🚨 乖離率與極端超買超賣過濾器 (防止追在阿呆谷或天花板)
-        # 價格距離 20MA 超過 2.2 倍 ATR，代表短線噴出或暴跌過劇，容易技術性劇烈反抽
+        # 計算當日/近 30 根 VWAP (成交量加權平均成本，法人日內多空分水嶺)
+        vwap_n = min(35, len(closes))
+        typ_prices = [(float(h) + float(l) + float(c)) / 3.0 for h, l, c in zip(highs[-vwap_n:], lows[-vwap_n:], closes[-vwap_n:])]
+        vols_recent = [max(1.0, float(v)) for v in df["volume"].to_list()[-vwap_n:]]
+        vwap_val = float(sum(tp * v for tp, v in zip(typ_prices, vols_recent)) / max(1.0, sum(vols_recent)))
+
+        # 🚨 乖離率、爆量長 K (Climax Bar) 與極端超買超賣過濾器 (防止追在阿呆谷或天花板被雙巴)
+        # 1. 價格距離 20MA 超過 2.0 倍 ATR 或距離 5MA 超過 1.15 倍 ATR，代表短線過度噴出/急殺
+        # 2. 最新一根 K 棒高低差超過 1.85 倍 ATR (如 300 點爆量長黑/長紅)，尾端追價極易遭下一根反抽掃損
         ma20_gap = curr_p - ma20
-        is_extreme_oversold = ma20_gap <= -atr_val * 2.2 or bb_pos <= 0.05
-        is_extreme_overbought = ma20_gap >= atr_val * 2.2 or bb_pos >= 0.95
+        ma5_gap = curr_p - ma5
+        curr_bar_range = float(highs[-1] - lows[-1])
+        is_bull_climax = (curr_bar_range >= atr_val * 1.85 and closes[-1] > opens[-1]) or (ma5_gap >= atr_val * 1.15)
+        is_bear_climax = (curr_bar_range >= atr_val * 1.85 and closes[-1] < opens[-1]) or (ma5_gap <= -atr_val * 1.15)
+        is_extreme_oversold = ma20_gap <= -atr_val * 2.0 or bb_pos <= 0.06 or is_bear_climax
+        is_extreme_overbought = ma20_gap >= atr_val * 2.0 or bb_pos >= 0.94 or is_bull_climax
 
         # ORB (Opening Range / 近 15 根箱型高低區間) 與近 5 根短線高低點
         recent_n = min(30, len(closes))
@@ -445,15 +457,20 @@ class FuturesAIAdvisor:
         long_score = 0
         short_score = 0
 
-        # (A) 均線平均成本判斷
+        # (A) 均線平均成本與法人 VWAP 價值中樞判斷
         if ma5 > ma20:
-            long_score += 22
+            long_score += 20
             if curr_p > ma5:
-                long_score += 10
+                long_score += 8
         else:
-            short_score += 22
+            short_score += 20
             if curr_p < ma5:
-                short_score += 10
+                short_score += 8
+
+        if curr_p > vwap_val:
+            long_score += 14
+        else:
+            short_score += 14
 
         if ma20 > ma60:
             long_score += 12
@@ -548,17 +565,22 @@ class FuturesAIAdvisor:
             else "綠柱收斂(跌勢趨緩)"
         )
         indicator_summary = (
-            f"均線成本 5MA({ma5:,.1f}) / 20MA({ma20:,.1f}) ｜ "
+            f"法人 VWAP({vwap_val:,.1f}) ｜ 均線 5MA({ma5:,.1f}) / 20MA({ma20:,.1f}) ｜ "
             f"布林上軌({bb_up:,.1f}) / 下軌({bb_low:,.1f}) ｜ "
-            f"MACD {macd_state} ｜ 單根波幅 ATR({atr_val:,.1f}{unit})"
+            f"MACD {macd_state} ｜ 波幅 ATR({atr_val:,.1f}{unit})"
         )
 
-        # 依據【布林通道上下軌 + 20MA 成本支撐/解套壓力 + 真實 ATR】計算合理短線目標與停損（絕不超過 1.2~2.0 倍 ATR）
+        # 依據【VWAP + ADX 趨勢濾網 + 布林通道 + 真實 ATR】計算合理短線目標與停損（絕不追高殺低）
         intel_tail = ""
         if cloud_intel is not None:
             intel_tail = f" 結合雲端情報：{cloud_intel.global_bias_label}、{cloud_intel.news_sentiment_label}。"
 
-        if base_long_prob >= 60.0 and not is_high_stalling and not is_extreme_overbought:
+        # ADX 死水盤濾網：當 ADX < 18 (無趨勢盤整易雙巴) 時，提高進場信心度門檻至 66%，且必須與 VWAP / 20MA 方向一致
+        entry_conf_gate = 66.0 if adx_val < 18.0 else 61.0
+        bull_trend_aligned = (curr_p >= vwap_val or curr_p >= ma20) and not (macd_hist < 0 and macd_hist < prev_macd_hist)
+        bear_trend_aligned = (curr_p <= vwap_val or curr_p <= ma20) and not (macd_hist > 0 and macd_hist > prev_macd_hist)
+
+        if base_long_prob >= entry_conf_gate and bull_trend_aligned and not is_high_stalling and not is_extreme_overbought:
             action = "BUY_LONG"
             action_label = "🟢 建議偏多買進 (BUY LONG)"
             conf = base_long_prob
@@ -588,7 +610,7 @@ class FuturesAIAdvisor:
                 f"【訊號】目前布林軌道位置在 {bb_pos*100:.0f}%，{bt_metrics['summary']}。{intel_tail}"
                 f"【方法】短線第一目標對齊布林上軌壓力 {tp_pt:,.1f} {unit}（約 {tp_gap/atr_val:.1f} 倍 ATR 合理波幅），防守線設於 {sl_pt:,.1f} {unit}。"
             )
-        elif base_short_prob >= 60.0 and not is_low_stalling and not is_extreme_oversold:
+        elif base_short_prob >= entry_conf_gate and bear_trend_aligned and not is_low_stalling and not is_extreme_oversold:
             action = "SELL_SHORT"
             action_label = "🔴 建議偏空賣出 (SELL SHORT)"
             conf = base_short_prob

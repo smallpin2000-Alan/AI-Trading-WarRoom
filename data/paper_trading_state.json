@@ -6,7 +6,7 @@
   "degradation_locked": false,
   "credibility_verified": true,
   "order_safety_locked": false,
-  "custom_tp_points": 40.0,
+  "custom_tp_points": 60.0,
   "daily_loss_baseline_pnl": 0.0,
   "initial_capital": 100000.0,
   "realized_pnl": 0.0,
@@ -55,20 +55,20 @@
     "exit": {
       "stop_loss": {
         "type": "fixed_points",
-        "value": 30.0,
+        "value": 45.0,
         "long": null,
         "short": null
       },
       "take_profit": {
         "type": "fixed_points",
-        "value": 45.0,
+        "value": 60.0,
         "long": null,
         "short": null
       },
       "trailing_stop": {
         "type": "points",
-        "value": 20.0,
-        "activation_points": 20.0
+        "value": 15.0,
+        "activation_points": 35.0
       },
       "time_exit": {
         "before_settlement": true,
@@ -103,12 +103,12 @@
   "closed_trades": [],
   "audit_logs": [
     {
-      "timestamp": "2026-11-10 16:07:00",
+      "timestamp": "2026-11-10 17:24:00",
       "event_type": "SYSTEM",
-      "message": "🔄 已執行全部模擬重置：虛擬本金恢復為 100,000 元，所有持倉、歷史成交與風控紀錄已全數清空。",
+      "message": "🔄 已執行全部模擬重置：虛擬本金恢復為 100,000 元，並升級機構級 VWAP+ADX+防雙巴冷靜期操盤引擎。",
       "price": null,
       "pnl": null
     }
   ],
-  "updated_at": "2026-11-10 16:07:00"
+  "updated_at": "2026-11-10 17:24:00"
 }

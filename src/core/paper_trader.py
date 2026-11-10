@@ -66,7 +66,7 @@ class PaperTradingEngine:
     4. 內建單日最大虧損鎖定 (Daily Max Loss Limit) 與一鍵緊急平倉 (Kill Switch)。
     """
 
-    VERSION = 6
+    VERSION = 7
 
     def __init__(
         self,
@@ -103,6 +103,10 @@ class PaperTradingEngine:
         self.audit_logs: List[AuditLogEntry] = []
         self._daily_loss_baseline_pnl: float = 0.0
         self._last_reset_ts: float = 0.0
+        self._last_stop_out_ts: float = 0.0
+        self._last_stop_out_dir: int = 0
+        self._last_stop_out_bar_ts: Optional[datetime] = None
+        self._last_entry_bar_ts: Optional[datetime] = None
 
     def _log(
         self,
@@ -241,6 +245,10 @@ class PaperTradingEngine:
         self.order_safety_locked = False
         self.credibility_verified = True
         self._last_reset_ts = time.time()
+        self._last_stop_out_ts = 0.0
+        self._last_stop_out_dir = 0
+        self._last_stop_out_bar_ts = None
+        self._last_entry_bar_ts = None
         self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
         if save_to_disk:
             self.save_state_to_disk()
@@ -493,45 +501,46 @@ class PaperTradingEngine:
 
         cols = {col: df_bars[col].to_list() for col in df_bars.columns}
         n_bars = df_bars.height
-        l = float(cols["low"][-1])
-        h = float(cols["high"][-1])
-        o = float(cols["open"][-1])
-        low_check = min(l, current_price)
-        high_check = max(h, current_price)
+        latest_bar_ts = cols["timestamp"][-1] if "timestamp" in cols and n_bars > 0 else None
+
+        # 關鍵修正：盤中即時保鏢檢核僅以「進場後真實即時報價 (current_price)」更新最高/最低價並觸發停損停利，
+        # 絕不誤拿整根 5 分 K 在進場前發生的歷史 High/Low/Open 回溯掃損！
+        self.position.highest_since_entry = max(self.position.highest_since_entry, current_price)
+        self.position.lowest_since_entry = min(self.position.lowest_since_entry, current_price)
 
         current_atr_val = read_atr_values(cols, self.strategy, max(0, n_bars - 2))
         stop_price, tp_price, stop_reason = self._compute_stop_and_tp(self.position, current_atr=current_atr_val)
         self.position.stop_loss_price = stop_price
         self.position.take_profit_price = tp_price
-        self.position.highest_since_entry = max(self.position.highest_since_entry, high_check)
-        self.position.lowest_since_entry = min(self.position.lowest_since_entry, low_check)
 
-        # 停損
+        # 停損 (以真實即時價 current_price 判定與出場，並啟動停損後防雙巴冷靜期 Cooldown)
         if stop_price is not None:
-            if self.position.direction == 1 and low_check <= stop_price:
-                raw_exit = min(stop_price, o)
-                tr = self._close_current_position(raw_exit, exit_idx=n_bars - 1, reason=stop_reason)
-                self._log("STOP_OUT", f"🛡️ 多單停損觸發 ({stop_reason}) @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元", price=tr.exit_price, pnl=tr.net_pnl)
+            if self.position.direction == 1 and current_price <= stop_price:
+                tr = self._close_current_position(current_price, exit_idx=n_bars - 1, reason=stop_reason)
+                self._last_stop_out_ts = time.time()
+                self._last_stop_out_dir = 1
+                self._last_stop_out_bar_ts = latest_bar_ts
+                self._log("STOP_OUT", f"🛡️ 多單停損觸發 ({stop_reason}) @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元 (啟動防雙巴冷靜期)", price=tr.exit_price, pnl=tr.net_pnl)
                 self.save_state_to_disk()
                 return f"多單停損 ({tr.net_pnl:+,.0f} 元)"
-            elif self.position.direction == -1 and high_check >= stop_price:
-                raw_exit = max(stop_price, o)
-                tr = self._close_current_position(raw_exit, exit_idx=n_bars - 1, reason=stop_reason)
-                self._log("STOP_OUT", f"🛡️ 空單停損觸發 ({stop_reason}) @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元", price=tr.exit_price, pnl=tr.net_pnl)
+            elif self.position.direction == -1 and current_price >= stop_price:
+                tr = self._close_current_position(current_price, exit_idx=n_bars - 1, reason=stop_reason)
+                self._last_stop_out_ts = time.time()
+                self._last_stop_out_dir = -1
+                self._last_stop_out_bar_ts = latest_bar_ts
+                self._log("STOP_OUT", f"🛡️ 空單停損觸發 ({stop_reason}) @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元 (啟動防雙巴冷靜期)", price=tr.exit_price, pnl=tr.net_pnl)
                 self.save_state_to_disk()
                 return f"空單停損 ({tr.net_pnl:+,.0f} 元)"
 
         # 停利
         if self.position is not None and tp_price is not None:
-            if self.position.direction == 1 and high_check >= tp_price:
-                raw_exit = max(tp_price, o)
-                tr = self._close_current_position(raw_exit, exit_idx=n_bars - 1, reason="take_profit")
+            if self.position.direction == 1 and current_price >= tp_price:
+                tr = self._close_current_position(current_price, exit_idx=n_bars - 1, reason="take_profit")
                 self._log("ORDER_FILL", f"🎯 多單停利成交 @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元", price=tr.exit_price, pnl=tr.net_pnl)
                 self.save_state_to_disk()
                 return f"多單停利 ({tr.net_pnl:+,.0f} 元)"
-            elif self.position.direction == -1 and low_check <= tp_price:
-                raw_exit = min(tp_price, o)
-                tr = self._close_current_position(raw_exit, exit_idx=n_bars - 1, reason="take_profit")
+            elif self.position.direction == -1 and current_price <= tp_price:
+                tr = self._close_current_position(current_price, exit_idx=n_bars - 1, reason="take_profit")
                 self._log("ORDER_FILL", f"🎯 空單停利成交 @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元", price=tr.exit_price, pnl=tr.net_pnl)
                 self.save_state_to_disk()
                 return f"空單停利 ({tr.net_pnl:+,.0f} 元)"
@@ -582,14 +591,37 @@ class PaperTradingEngine:
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         pos_dir = self.position.direction if self.position else 0
+        latest_bar_ts = df_bars["timestamp"][-1] if df_bars.height > 0 and "timestamp" in df_bars.columns else None
 
         # 若方向一致，續抱
         if pos_dir == target_dir:
             return None
 
-        # 若持有反向單，先平倉
+        # 防雙巴鐵律 1：同根 5m K 棒不重複開倉，且停損出場後強制執行 5 分鐘 (300秒) 冷靜期 (Anti-Whipsaw Cooldown)
+        if pos_dir == 0:
+            if (
+                getattr(self, "_last_entry_bar_ts", None) is not None
+                and latest_bar_ts is not None
+                and latest_bar_ts <= self._last_entry_bar_ts
+            ):
+                return None
+            if (
+                getattr(self, "_last_stop_out_bar_ts", None) is not None
+                and latest_bar_ts is not None
+                and latest_bar_ts <= self._last_stop_out_bar_ts
+            ):
+                return None
+            if (
+                time.time() - getattr(self, "_last_stop_out_ts", 0.0) < 300.0
+                and target_dir == getattr(self, "_last_stop_out_dir", 0)
+            ):
+                return None
+
+        # 防雙巴鐵律 2：若已持有部位，必須反向訊號具備高確信度 (>= 68%) 才允許反手，避免在盤整區被 60% 臨界訊號來回巴
         closed_msg = ""
         if pos_dir != 0:
+            if confidence < 68.0:
+                return None
             tr = self._close_current_position(current_price, exit_idx=-1, reason=f"AI反手平倉 ({source_note})")
             closed_msg = f"已平倉反向單 @ {tr.exit_price:,.1f} (損益 {tr.net_pnl:+,.0f} 元) ➔ "
             self._log("ORDER_FILL", f"AI反手平倉：{tr.exit_reason} @ {tr.exit_price:,.1f}，淨損益: {tr.net_pnl:,.0f} 元", price=tr.exit_price, pnl=tr.net_pnl)
@@ -603,6 +635,7 @@ class PaperTradingEngine:
         # 開新倉
         opened = self._open_new_position(target_dir, current_price, now_str, reason=f"AI訊號進場 ({source_note}, 信心度{confidence:.0f}%)", entry_atr=atr_entry_val)
         if opened:
+            self._last_entry_bar_ts = latest_bar_ts
             self.save_state_to_disk()
             dir_zh = "多單" if target_dir == 1 else "空單"
             return f"{closed_msg}成功開立 {dir_zh} 1 口 @ {current_price:,.1f}"

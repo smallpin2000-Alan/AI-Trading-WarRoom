@@ -84,9 +84,9 @@ def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
             "entry_long": {"cross_above": ["ma5", "ma20"]},
             "entry_short": {"cross_below": ["ma5", "ma20"]},
             "exit": {
-                "stop_loss": {"type": "fixed_points", "value": 30.0},
-                "take_profit": {"type": "fixed_points", "value": 45.0},
-                "trailing_stop": {"type": "points", "value": 20.0, "activation_points": 20.0},
+                "stop_loss": {"type": "fixed_points", "value": 45.0},
+                "take_profit": {"type": "fixed_points", "value": 60.0},
+                "trailing_stop": {"type": "points", "value": 15.0, "activation_points": 35.0},
             },
         })
         pt = PaperTradingEngine(
@@ -216,7 +216,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.8.3"
+APP_VERSION = "v2.8.4"
 _refreshing_advice_keys: set[str] = set()
 
 
