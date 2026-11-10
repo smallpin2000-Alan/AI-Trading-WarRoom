@@ -25,7 +25,7 @@ from src.schema.strategy import StrategySchema
 
 def load_taishin_default_config() -> dict:
     cfg = {
-        "symbol": os.getenv("SOL_SYMBOL", "2330"),
+        "symbol": os.getenv("SOL_SYMBOL", "TMFR1"),
         "sol_user_id": os.getenv("SOL_USER_ID", ""),
         "sol_password": os.getenv("SOL_PASSWORD", ""),
         "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
@@ -139,13 +139,13 @@ st.markdown("""
 
 
 DEFAULT_WATCHLIST = [
+    "TMFR1 (微台指近一)",
+    "TXFR1 (大台指近一)",
+    "MTXR1 (小台指近一)",
     "2330 (台積電)",
     "2317 (鴻海)",
     "2454 (聯發科)",
     "0050 (元大台灣50)",
-    "TMFR1 (微台指近月)",
-    "TXFR1 (大台指近月)",
-    "MTXR1 (小台指近月)",
 ]
 
 
@@ -210,7 +210,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.7.9"
+APP_VERSION = "v2.8.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -260,9 +260,12 @@ def main():
             st.session_state["last_active_time"] = time.time()
             st.rerun()
 
-    # ==================== 1. 頂部統一控制列（全站唯一選商品處） ====================
+    # ==================== 1. 頂部統一控制列（全站唯一選商品處，開啟網頁預設直接鎖定微台 TMFR1） ====================
     watchlist_items = load_watchlist()
-    default_idx = 0
+    default_idx = next(
+        (i for i, item in enumerate(watchlist_items) if item.startswith("TMFR1")),
+        0,
+    )
     if "selected_watchlist_item" in st.session_state and st.session_state["selected_watchlist_item"] in watchlist_items:
         default_idx = watchlist_items.index(st.session_state["selected_watchlist_item"])
 

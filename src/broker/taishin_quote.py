@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 19
+    VERSION = 20
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -51,7 +51,7 @@ class TaishinQuoteFeed:
         self.ta_connected = False
         self.ta_rcv_done = False
         self.status_msg = "未連線"
-        self.symbol = "2330"
+        self.symbol = "TMFR1"
         self.current_user_id = ""
         self.current_password = ""
         self._conn_lock = threading.Lock()
