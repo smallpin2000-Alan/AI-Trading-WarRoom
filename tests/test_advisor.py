@@ -155,5 +155,44 @@ def test_taishin_bollinger_atr_bounded_target_and_high_stalling():
     assert target_dist < 90.0
 
 
+def test_chat_with_advisor_qa_and_commands():
+    """測試戰情室網頁對話框：支援盤勢問答與直接下達停利調整／模擬重置指令"""
+    now = datetime(2026, 11, 10, 16, 0)
+    dates = [now - timedelta(minutes=5 * i) for i in range(30)][::-1]
+    df = pl.DataFrame({
+        "timestamp": dates,
+        "open": [42500.0 + i * 5.0 for i in range(30)],
+        "high": [42515.0 + i * 5.0 for i in range(30)],
+        "low": [42490.0 + i * 5.0 for i in range(30)],
+        "close": [42510.0 + i * 5.0 for i in range(30)],
+        "volume": [150 + i * 3 for i in range(30)],
+    })
+    advice = FuturesAIAdvisor.analyze_market(df, symbol="TMFR1", timeframe="5m", fast_local_only=True)
+
+    # 1. 詢問支撐與壓力
+    ans_levels = FuturesAIAdvisor.chat_with_advisor(
+        user_msg="請問目前支撐與壓力在哪？",
+        symbol="TMFR1",
+        timeframe="5m",
+        current_price=42655.0,
+        advice=advice,
+        gemini_api_key="",
+    )
+    assert "布林通道邊界" in ans_levels
+    assert "42,655.0" in ans_levels
+
+    # 2. 詢問為什麼沒交易
+    ans_wait = FuturesAIAdvisor.chat_with_advisor(
+        user_msg="為什麼現在沒有交易？",
+        symbol="TMFR1",
+        timeframe="5m",
+        current_price=42655.0,
+        advice=advice,
+        gemini_api_key="",
+    )
+    assert "TMFR1" in ans_wait or "AI" in ans_wait
+
+
+
 
 

@@ -921,3 +921,202 @@ class FuturesAIAdvisor:
             print(f"FuturesAIAdvisor: Gemini 呼叫例外，自動切換至本地量化回退: {e}")
 
         return None
+
+    @classmethod
+    def chat_with_advisor(
+        cls,
+        user_msg: str,
+        symbol: str,
+        timeframe: str,
+        current_price: float,
+        advice: Optional[FuturesAdvice] = None,
+        paper_trader: Any = None,
+        chat_history: Optional[list[dict[str, str]]] = None,
+        gemini_api_key: str = "",
+        gemini_model: str = "gemini-3.5-flash-lite",
+    ) -> str:
+        """
+        戰情室網頁即時對話顧問 (Interactive Web Copilot)：
+        - 支援直接在對話框輸入自然語言指令（如：「重置10萬」、「平倉」、「停利改50點」、「為什麼沒交易」、「支撐壓力在哪」）。
+        - 自動結合當下 K 線指標、6 大戰法共振與模擬倉持倉損益進行回答。
+        """
+        msg = (user_msg or "").strip()
+        if not msg:
+            return "請輸入您想詢問的盤勢問題或操盤指令！"
+
+        is_fut = cls.is_futures(symbol)
+        unit = "點" if is_fut else "元"
+        executed_actions: list[str] = []
+
+        # 1. 檢查是否包含可直接執行的模擬倉操作指令
+        if paper_trader is not None:
+            if any(k in msg for k in ["重置", "回10萬", "回到10萬", "歸零", "清空紀錄"]):
+                paper_trader.reset_all_simulation(initial_capital=100_000.0)
+                executed_actions.append("✅ **已為您執行【全部模擬重置】**：虛擬總權益已恢復為 **100,000 元**，所有未平倉部位與歷史紀錄已全數清空。")
+            elif any(k in msg for k in ["平倉", "出場", "砍單", "全平"]) and not any(k in msg for k in ["為什麼", "何時", "怎麼"]):
+                if paper_trader.position is not None and current_price > 0:
+                    res_close = paper_trader.trigger_kill_switch(current_price, reason="對話框指令手動平倉")
+                    paper_trader.reset_risk_locks(reset_daily_accounting=False)
+                    paper_trader.is_active = True
+                    paper_trader.save_state_to_disk()
+                    executed_actions.append(f"✅ **已依指令執行平倉**：{res_close}")
+                else:
+                    executed_actions.append("ℹ️ 目前帳戶為**空手 (無未平倉部位)**，無須執行平倉。")
+            elif any(k in msg for k in ["鎖定下單", "下單鎖定", "鎖住下單"]):
+                paper_trader.order_safety_locked = True
+                paper_trader.save_state_to_disk()
+                executed_actions.append("🔒 **已開啟【下單安全鎖】**：目前僅監控既有部位停損停利，暫停新開倉。")
+            elif any(k in msg for k in ["解鎖下單", "下單解鎖", "解除鎖定"]):
+                paper_trader.order_safety_locked = False
+                paper_trader.reset_risk_locks(reset_daily_accounting=True)
+                paper_trader.save_state_to_disk()
+                executed_actions.append("⚡ **已解除【下單安全鎖與風控鎖定】**：系統已恢復正常跟隨 AI 訊號自動操盤。")
+            elif any(k in msg for k in ["暫停操盤", "停止操盤", "暫停交易"]):
+                paper_trader.stop_monitoring(current_price)
+                paper_trader.save_state_to_disk()
+                executed_actions.append("⏸️ **已暫停 AI 自動模擬操盤**。")
+            elif any(k in msg for k in ["啟動操盤", "開始操盤", "恢復操盤", "開始交易"]):
+                paper_trader.start_monitoring()
+                paper_trader.save_state_to_disk()
+                executed_actions.append("▶️ **已啟動 AI 自動模擬操盤**。")
+
+            # 檢查「停利改 XX 點」
+            m_tp = re.search(r"停利.*?(?:改|設|調).*?(\d+(?:\.\d+)?)", msg)
+            if m_tp:
+                new_tp_val = float(m_tp.group(1))
+                if 0 <= new_tp_val <= 500:
+                    paper_trader.custom_tp_points = new_tp_val
+                    paper_trader.save_state_to_disk()
+                    executed_actions.append(f"🎯 **已將【自動停利點數】調整為 `{new_tp_val:.0f} {unit}`**。")
+
+        # 2. 整理當前盤勢與帳戶狀態摘要
+        pos_desc = "目前空手 (0 口)"
+        equity_str = "100,000 元"
+        realized_str = "+0 元"
+        trades_cnt = 0
+        if paper_trader is not None:
+            eq_val = paper_trader.get_total_equity(current_price)
+            ur_val = paper_trader.get_unrealized_pnl(current_price)
+            rl_val = paper_trader.realized_pnl
+            equity_str = f"{eq_val:,.0f} 元"
+            realized_str = f"{rl_val:+,.0f} 元"
+            trades_cnt = len(paper_trader.closed_trades)
+            if paper_trader.position is not None:
+                p_obj = paper_trader.position
+                d_str = "多單 (Long)" if p_obj.direction == 1 else "空單 (Short)"
+                pos_desc = (
+                    f"持有 {d_str} {p_obj.contracts} 口 @ 成本 {p_obj.entry_price:,.1f} "
+                    f"(浮動損益 {ur_val:+,.0f} 元 | 防守停損 {p_obj.stop_loss_price or 0:,.1f} | 目標停利 {p_obj.take_profit_price or 0:,.1f})"
+                )
+
+        adv_action = advice.action_label if advice else "計算中"
+        adv_conf = f"{advice.confidence:.0f}%" if advice else "--"
+        adv_ind = advice.indicator_summary if advice else "--"
+        adv_sig = advice.signal_summary if advice else "--"
+        adv_mtd = advice.method_summary if advice else "--"
+        adv_ens = advice.ensemble_votes_summary if advice else "--"
+        adv_rat = advice.rationale if advice else "--"
+
+        # 3. 若有設定 Gemini API Key，優先請 Gemini 結合即時盤勢與對話紀錄回答
+        api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        if api_key:
+            try:
+                hist_lines = []
+                for h in (chat_history or [])[-6:]:
+                    r_name = "使用者" if h.get("role") == "user" else "AI顧問"
+                    hist_lines.append(f"{r_name}: {h.get('content', '')}")
+                hist_block = "\n".join(hist_lines) if hist_lines else "(無先前對話)"
+                exec_block = "\n".join(executed_actions) if executed_actions else "(本輪無直接執行指令)"
+
+                prompt = f"""你是戰情室網頁內建的「🎯 AI 智慧看盤與多空決策首席顧問」。
+請用親切、專業、條理分明的繁體中文，直接回答使用者在網頁對話框提出的問題。
+
+【即時戰情室盤面數據】
+- 標的：{symbol} ({timeframe} K線) | 最新報價：{current_price:,.1f} {unit}
+- 當前 AI 決策：{adv_action} (信心度：{adv_conf})
+- 量化矩陣投票：{adv_ens}
+- 指標狀態：{adv_ind}
+- 訊號解讀：{adv_sig}
+- 操作方法：{adv_mtd}
+- 完整分析理由：{adv_rat}
+
+【使用者模擬帳戶即時狀態】
+- 虛擬總權益：{equity_str} | 已實現累計損益：{realized_str} (累計成交 {trades_cnt} 筆)
+- 目前持倉：{pos_desc}
+- 本輪已自動執行之系統動作：{exec_block}
+
+【近期對話紀錄】
+{hist_block}
+
+【使用者最新提問】
+{msg}
+
+請直接給出精準、具體（引用上方真實報價與指標數值）的回答，字數控制在 80~220 字內，若已執行系統動作請一併向使用者確認。"""
+
+                model_target = gemini_model or "gemini-3.5-flash-lite"
+                if "gemini-2.5" in model_target or model_target == "gemini-3.5-flash":
+                    model_target = "gemini-3.5-flash-lite"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_target}:generateContent"
+                headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.25},
+                }
+                res = requests.post(url, headers=headers, json=payload, timeout=12)
+                if res.status_code == 200:
+                    data = res.json()
+                    reply_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if executed_actions:
+                        return "\n\n".join(executed_actions) + "\n\n" + reply_txt
+                    return reply_txt
+            except Exception as ex:
+                print(f"FuturesAIAdvisor.chat_with_advisor Gemini fallback: {ex}")
+
+        # 4. 本地零延遲量化顧問智慧回答 (無須 API Key 或當 API 忙碌時 0.01 秒秒回)
+        parts: list[str] = []
+        if executed_actions:
+            parts.extend(executed_actions)
+
+        if any(k in msg for k in ["為什麼沒", "沒交易", "沒有交易", "不進場", "觀望", "WAIT", "何時進場"]):
+            if advice and advice.action == "WAIT":
+                parts.append(
+                    f"📊 **目前尚未進場的原因（AI 判定：`{adv_action}`）**：\n"
+                    f"- **盤面指標**：`{adv_ind}`\n"
+                    f"- **關鍵訊號**：{adv_sig}。\n"
+                    f"- **進場觸發條件**：{adv_mtd}。\n"
+                    f"💡 模擬操盤引擎在 `WAIT (觀望)` 狀態下會嚴格保護本金不亂追單；一旦價格帶量突破分水嶺、轉為明確 `BUY LONG` 或 `SELL SHORT`（且信心度 $\\ge 60\\%$），系統就會立即自動建倉！"
+                )
+            else:
+                parts.append(
+                    f"⚡ **目前 AI 已發出明確訊號：`{adv_action}`（信心度 `{adv_conf}`）**！\n"
+                    f"- **目前持倉狀態**：{pos_desc}\n"
+                    f"- **操作規劃**：{adv_mtd}"
+                )
+        elif any(k in msg for k in ["支撐", "壓力", "目標", "停損", "價位", "點位"]):
+            if advice:
+                parts.append(
+                    f"🎯 **`{symbol}` ({timeframe}) 關鍵價位與支撐壓力診斷**：\n"
+                    f"- **最新成交價**：`{current_price:,.1f} {unit}`\n"
+                    f"- **布林通道邊界**：上軌壓力 `{advice.bb_upper:,.1f}` ／ 20MA 中軸成本 `{advice.bb_middle:,.1f}` ／ 下軌支撐 `{advice.bb_lower:,.1f}`（單根 ATR 波幅 `{advice.atr_val:,.1f} {unit}`）\n"
+                    f"- **AI 建議進場區**：`{advice.entry_zone}`\n"
+                    f"- **防守停損價**：`{advice.stop_loss}` ｜ **短線目標價**：`{advice.target_price}`"
+                )
+        elif any(k in msg for k in ["持倉", "部位", "損益", "賺", "賠", "帳戶", "多少錢"]):
+            parts.append(
+                f"💼 **模擬操盤帳戶即時診斷**：\n"
+                f"- **虛擬總權益**：`{equity_str}`（已實現損益：`{realized_str}`，累計已平倉 `{trades_cnt}` 筆）\n"
+                f"- **目前持倉**：{pos_desc}\n"
+                f"- **風控保護**：單日最大虧損上限 `{paper_trader.risk_config.max_daily_loss:,.0f} 元`、自動停利設定 `{getattr(paper_trader, 'custom_tp_points', 40.0):.0f} {unit}`。"
+            )
+        else:
+            parts.append(
+                f"🤖 **AI 戰情顧問即時回報（`{symbol}` @ `{current_price:,.1f} {unit}`）**：\n"
+                f"- **當前決策**：**{adv_action}**（信心度 `{adv_conf}` ｜ {adv_ens}）\n"
+                f"- **指標與訊號**：{adv_ind}；{adv_sig}\n"
+                f"- **建議操作**：{adv_mtd}\n"
+                f"- **帳戶現況**：總權益 `{equity_str}`，{pos_desc}\n"
+                f"💬 *您可以直接對我說：「為什麼沒交易？」、「目前支撐壓力在哪？」、「診斷我的持倉」、「把停利改成 50 點」、「幫我平倉」或「重置回 10 萬」！*"
+            )
+
+        return "\n\n".join(parts)
+
