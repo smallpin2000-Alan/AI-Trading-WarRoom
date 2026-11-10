@@ -216,7 +216,7 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
-APP_VERSION = "v2.8.2"
+APP_VERSION = "v2.8.3"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -868,71 +868,76 @@ def main():
                 else:
                     st.caption("目前尚無稽核日誌")
 
-        # ==================== 2.8 💬 AI 戰情操盤顧問即時對話框 (可直接在網頁與 AI 對話 / 下達操盤指令) ====================
-        if "war_room_chat_history" not in st.session_state:
-            st.session_state["war_room_chat_history"] = [
-                {
-                    "role": "assistant",
-                    "content": (
-                        "👋 您好！我是您的 **AI 戰情室即時操盤顧問**。\n"
-                        "您可以直接在下方輸入問題或下達操作指令，例如：\n"
-                        "- 📊 **盤勢提問**：「為什麼現在沒有交易？」、「目前支撐跟壓力在哪？」、「現在適合做多還是做空？」\n"
-                        "- ⚡ **直接指令**：「幫我把停利改成 50 點」、「幫我平倉」、「幫我重置回 10 萬」、「鎖定下單」"
-                    ),
-                }
-            ]
+        # ==================== 2.8 💬 AI 戰情操盤顧問即時對話框 (獨立 Fragment，不受 15 秒刷新干擾，發送立即回覆) ====================
+        @st.fragment
+        def _render_ai_chat_box():
+            if "war_room_chat_history" not in st.session_state:
+                st.session_state["war_room_chat_history"] = [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "👋 您好！我是您的 **AI 戰情室即時操盤顧問**。\n"
+                            "您可以直接在下方輸入問題或下達操作指令，例如：\n"
+                            "- 📊 **盤勢提問**：「為什麼現在沒有交易？」、「目前支撐跟壓力在哪？」、「現在適合做多還是做空？」\n"
+                            "- ⚡ **直接指令**：「幫我把停利改成 50 點」、「幫我平倉」、「幫我重置回 10 萬」、「鎖定下單」"
+                        ),
+                    }
+                ]
 
-        with st.expander("💬 AI 戰情操盤顧問即時對話框（可直接問盤勢、查部位損益、或下達「平倉 / 重置10萬 / 停利改50點」指令）", expanded=True):
-            q_c1, q_c2, q_c3, q_c4 = st.columns([1.2, 1.2, 1.2, 0.8])
-            quick_prompt = None
-            with q_c1:
-                if st.button("❓ 為什麼現在沒交易 / 觀望？", key="btn_qa_why_wait", width="stretch"):
-                    quick_prompt = "為什麼現在沒有交易？何時才會進場？"
-            with q_c2:
-                if st.button("🎯 目前支撐與壓力點位在哪？", key="btn_qa_levels", width="stretch"):
-                    quick_prompt = f"請幫我診斷目前 {clean_sym} 的支撐、壓力與目標停損點位"
-            with q_c3:
-                if st.button("💼 診斷我目前的持倉與損益", key="btn_qa_pos", width="stretch"):
-                    quick_prompt = "請幫我診斷目前的模擬帳戶持倉部位、損益與風控狀態"
-            with q_c4:
-                if st.button("🧹 清空對話紀錄", key="btn_qa_clear", width="stretch"):
-                    st.session_state["war_room_chat_history"] = st.session_state["war_room_chat_history"][:1]
-                    st.rerun()
+            with st.expander("💬 AI 戰情操盤顧問即時對話框（可直接問盤勢、查部位損益、或下達「平倉 / 重置10萬 / 停利改50點」指令）", expanded=True):
+                q_c1, q_c2, q_c3, q_c4 = st.columns([1.2, 1.2, 1.2, 0.8])
+                quick_prompt = None
+                with q_c1:
+                    if st.button("❓ 為什麼現在沒交易 / 觀望？", key="btn_qa_why_wait", width="stretch"):
+                        quick_prompt = "為什麼現在沒有交易？何時才會進場？"
+                with q_c2:
+                    if st.button("🎯 目前支撐與壓力點位在哪？", key="btn_qa_levels", width="stretch"):
+                        quick_prompt = f"請幫我診斷目前 {clean_sym} 的支撐、壓力與目標停損點位"
+                with q_c3:
+                    if st.button("💼 診斷我目前的持倉與損益", key="btn_qa_pos", width="stretch"):
+                        quick_prompt = "請幫我診斷目前的模擬帳戶持倉部位、損益與風控狀態"
+                with q_c4:
+                    if st.button("🧹 清空對話紀錄", key="btn_qa_clear", width="stretch"):
+                        st.session_state["war_room_chat_history"] = st.session_state["war_room_chat_history"][:1]
 
-            with st.form(key="war_room_chat_form", clear_on_submit=True):
-                in_col1, in_col2 = st.columns([4.5, 1.0])
-                with in_col1:
-                    user_chat_input = st.text_input(
-                        "輸入問題或操盤指令",
-                        placeholder="直接跟我對話，例如：現在為什麼沒進場？ / 支撐壓力在哪？ / 停利改 50 點 / 幫我重置回 10 萬...",
-                        label_visibility="collapsed",
-                    )
-                with in_col2:
-                    send_chat = st.form_submit_button("📨 發送對話", type="primary", width="stretch")
+                with st.form(key="war_room_chat_form", clear_on_submit=True):
+                    in_col1, in_col2 = st.columns([4.5, 1.0])
+                    with in_col1:
+                        user_chat_input = st.text_input(
+                            "輸入問題或操盤指令",
+                            placeholder="直接跟我對話，例如：現在為什麼沒進場？ / 支撐壓力在哪？ / 停利改 50 點 / 幫我重置回 10 萬...",
+                            label_visibility="collapsed",
+                        )
+                    with in_col2:
+                        send_chat = st.form_submit_button("📨 發送對話", type="primary", width="stretch")
 
-            active_msg = quick_prompt or (user_chat_input.strip() if (send_chat and user_chat_input) else None)
-            if active_msg:
-                st.session_state["last_active_time"] = time.time()
-                st.session_state["war_room_chat_history"].append({"role": "user", "content": active_msg})
-                reply_text = FuturesAIAdvisor.chat_with_advisor(
-                    user_msg=active_msg,
-                    symbol=clean_sym,
-                    timeframe=chart_tf,
-                    current_price=curr_price,
-                    advice=advice,
-                    paper_trader=pt,
-                    chat_history=st.session_state["war_room_chat_history"][:-1],
-                    gemini_api_key=default_cfg.get("gemini_api_key", ""),
-                    gemini_model=default_cfg.get("gemini_model", "gemini-3.5-flash-lite"),
-                )
-                st.session_state["war_room_chat_history"].append({"role": "assistant", "content": reply_text})
-                st.rerun()
+                active_msg = quick_prompt or (user_chat_input.strip() if (send_chat and user_chat_input) else None)
+                if active_msg:
+                    st.session_state["last_active_time"] = time.time()
+                    st.session_state["war_room_chat_history"].append({"role": "user", "content": active_msg})
+                    with st.spinner("🤖 AI 顧問正在分析回覆中..."):
+                        reply_text = FuturesAIAdvisor.chat_with_advisor(
+                            user_msg=active_msg,
+                            symbol=clean_sym,
+                            timeframe=chart_tf,
+                            current_price=curr_price,
+                            advice=advice,
+                            paper_trader=pt,
+                            chat_history=st.session_state["war_room_chat_history"][:-1],
+                            gemini_api_key=default_cfg.get("gemini_api_key", ""),
+                            gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
+                        )
+                    st.session_state["war_room_chat_history"].append({"role": "assistant", "content": reply_text})
+                    if any(k in active_msg for k in ["重置", "回10萬", "平倉", "出場", "砍單", "停利", "鎖定", "解鎖", "暫停", "啟動"]):
+                        st.rerun()
 
-            # 顯示最近 6 則對話訊息
-            for msg_item in st.session_state["war_room_chat_history"][-6:]:
-                role_label = "assistant" if msg_item.get("role") == "assistant" else "user"
-                with st.chat_message(role_label):
-                    st.markdown(msg_item.get("content", ""))
+                # 顯示最近 8 則對話訊息（最新對話立即呈現在最下方）
+                for msg_item in st.session_state["war_room_chat_history"][-8:]:
+                    role_label = "assistant" if msg_item.get("role") == "assistant" else "user"
+                    with st.chat_message(role_label):
+                        st.markdown(msg_item.get("content", ""))
+
+        _render_ai_chat_box()
 
         st.markdown("---")
         k_top1, k_top2, k_top3 = st.columns([2.3, 1.0, 0.9])
@@ -956,6 +961,14 @@ def main():
 
         if df_bars.height > 0:
             df_plot = df_bars.to_pandas()
+            if len(df_plot) > 3:
+                med_p = float(df_plot["close"].median())
+                if med_p > 0:
+                    df_plot = df_plot[
+                        (df_plot["close"] >= med_p * 0.65)
+                        & (df_plot["close"] <= med_p * 1.35)
+                        & (df_plot["low"] >= med_p * 0.65)
+                    ].reset_index(drop=True)
             df_plot["time_label"] = df_plot["timestamp"].dt.strftime("%m-%d %H:%M")
             df_plot["ma5"] = df_plot["close"].rolling(5).mean()
             df_plot["ma20"] = df_plot["close"].rolling(20).mean()

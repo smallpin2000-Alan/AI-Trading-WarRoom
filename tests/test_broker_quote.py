@@ -7,7 +7,7 @@ from src.core.bar_builder import TickData
 
 def test_taishin_quote_feed_time_parsing():
     """測試台新行情模組的時間解析與 TickData 轉換"""
-    feed = TaishinQuoteFeed()
+    feed = TaishinQuoteFeed(store_dir=None)
 
     # 測試冒號格式 HH:MM:SS
     dt1 = feed._parse_match_time("09:15:30")
@@ -24,7 +24,7 @@ def test_taishin_quote_feed_time_parsing():
 
 def test_taishin_quote_feed_aggregation():
     """測試將台新推送的 Tick 即時聚合成 K 棒"""
-    feed = TaishinQuoteFeed()
+    feed = TaishinQuoteFeed(store_dir=None)
 
     ticks = [
         TickData(datetime(2026, 10, 22, 9, 0, 1), 20100.0, 10),
@@ -47,7 +47,8 @@ def test_taishin_quote_feed_aggregation():
 
 def test_taishin_quote_feed_on_match_and_snapshot_callbacks():
     """測試台新 Sol_D API OnMatch 與 OnUpdateLastSnapshot 事件回呼及 K 棒合成"""
-    feed = TaishinQuoteFeed()
+    feed = TaishinQuoteFeed(store_dir=None)
+    feed.symbol = "2330"
     received = []
     feed.register_on_tick(lambda tk: received.append(tk))
 
@@ -72,7 +73,8 @@ def test_taishin_quote_feed_on_match_and_snapshot_callbacks():
 
 def test_taishin_tech_analysis_kbar_callbacks():
     """測試台新 TechAnalysis API 1m K 棒接收與週期轉換"""
-    feed = TaishinQuoteFeed()
+    feed = TaishinQuoteFeed(store_dir=None)
+    feed.symbol = "2330"
 
     raw_results = [
         SimpleNamespace(

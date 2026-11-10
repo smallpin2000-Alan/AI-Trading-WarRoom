@@ -23,3 +23,10 @@
 - 下單執行前必須通過五道可信度檢核。
 - 策略停損為強制品，若無停損設定絕對不可執行。
 - 行情模組為純報價接收（Market Data Feed），絕不發送委託下單指令。
+
+### 3. 每次修改程式後必須附上雲端網站更新指令
+- 每次修改程式碼並推送至 GitHub (`master` 與 `main`) 後，**回覆使用者時必須貼上包含完整專案 ID (`point-api-512405`) 的 Google Cloud Shell 一鍵更新 Cloud Run 網站指令**：
+  ```bash
+  cd ~/AI-Trading-WarRoom && git fetch origin master && git reset --hard origin/master && gcloud config set project point-api-512405 && gcloud run deploy ai-trading-warroom --source . --project point-api-512405 --region asia-east1 --allow-unauthenticated
+  ```
+

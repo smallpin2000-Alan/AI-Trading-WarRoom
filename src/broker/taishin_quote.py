@@ -37,7 +37,7 @@ class TaishinQuoteFeed:
     - 純報價接收 (Market Data Only)，絕不發送任何交易下單委託指令。
     """
 
-    VERSION = 21
+    VERSION = 22
     _last_sync_ts: Dict[str, float] = {}
     _last_server_pull_dt: Dict[str, datetime.datetime] = {}
     _last_server_bar_dt: Dict[str, datetime.datetime] = {}
@@ -887,6 +887,13 @@ class TaishinQuoteFeed:
                         source_name = f"台灣期交所官網 MIS 伺服器 ({sym_id})"
 
             with self.lock:
+                if not is_stock and any(k in symbol for k in ("TMF", "TXF", "MTX", "MXF")):
+                    bad_dts = [
+                        dt for dt, b in self.kbars_1m.items()
+                        if float(b.get("close", 0.0)) < 8000.0 or float(b.get("low", 0.0)) < 8000.0
+                    ]
+                    for b_dt in bad_dts:
+                        self.kbars_1m.pop(b_dt, None)
                 if self.kbars_1m:
                     if pulled_live > 0:
                         last_dt = max(self.kbars_1m.keys())
@@ -1272,10 +1279,12 @@ class TaishinQuoteFeed:
             is_stock = self.symbol.isdigit()
 
         if kbars_list:
+            is_idx_fut = not is_stock and any(k in self.symbol.upper() for k in ("TMF", "TXF", "MTX", "MXF"))
             filtered = [
                 b for b in kbars_list
                 if SharedBarBuilder.is_valid_session_time(b["timestamp"], session)
                 and (not is_stock or ((9, 0) <= (b["timestamp"].hour, b["timestamp"].minute) <= (13, 35)))
+                and (not is_idx_fut or (float(b.get("close", 0.0)) >= 8000.0 and float(b.get("low", 0.0)) >= 8000.0))
             ]
             if not filtered:
                 return self._empty_bars_df()

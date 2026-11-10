@@ -851,12 +851,8 @@ class FuturesAIAdvisor:
   "rationale": "依【指標】【訊號】【方法】三要素撰寫 110~150 字繁體中文專業分析"
 }}
 """
-            # 自動選用最佳穩定低延遲模型，以 gemini-3.5-flash-lite 為首選避免 503 伺服器超載
-            model_target = model_name or "gemini-3.5-flash-lite"
-            if "gemini-2.5" in model_target or model_target == "gemini-3.5-flash":
-                model_target = "gemini-3.5-flash-lite"
-
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_target}:generateContent"
+            # 自動選用最佳穩定低延遲模型，以 gemini-3-flash-preview 為首選避免舊版 404 或 503
+            model_target = "gemini-3-flash-preview"
             headers = {
                 "Content-Type": "application/json",
                 "x-goog-api-key": api_key,
@@ -868,8 +864,18 @@ class FuturesAIAdvisor:
                     "temperature": 0.15
                 }
             }
-            res = requests.post(url, headers=headers, json=payload, timeout=15)
-            if res.status_code == 200:
+            res = None
+            for cand_m in ("gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{cand_m}:generateContent"
+                try:
+                    r_try = requests.post(url, headers=headers, json=payload, timeout=12)
+                    if r_try.status_code == 200:
+                        res = r_try
+                        model_target = cand_m
+                        break
+                except Exception:
+                    continue
+            if res is not None and res.status_code == 200:
                 data = res.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 parsed = json.loads(text)
@@ -1053,22 +1059,23 @@ class FuturesAIAdvisor:
 
 請直接給出精準、具體（引用上方真實報價與指標數值）的回答，字數控制在 80~220 字內，若已執行系統動作請一併向使用者確認。"""
 
-                model_target = gemini_model or "gemini-3.5-flash-lite"
-                if "gemini-2.5" in model_target or model_target == "gemini-3.5-flash":
-                    model_target = "gemini-3.5-flash-lite"
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_target}:generateContent"
                 headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {"temperature": 0.25},
                 }
-                res = requests.post(url, headers=headers, json=payload, timeout=12)
-                if res.status_code == 200:
-                    data = res.json()
-                    reply_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    if executed_actions:
-                        return "\n\n".join(executed_actions) + "\n\n" + reply_txt
-                    return reply_txt
+                for cand_model in ("gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"):
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{cand_model}:generateContent"
+                    try:
+                        res = requests.post(url, headers=headers, json=payload, timeout=10)
+                        if res.status_code == 200:
+                            data = res.json()
+                            reply_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if executed_actions:
+                                return "\n\n".join(executed_actions) + "\n\n" + reply_txt
+                            return reply_txt
+                    except Exception:
+                        continue
             except Exception as ex:
                 print(f"FuturesAIAdvisor.chat_with_advisor Gemini fallback: {ex}")
 
