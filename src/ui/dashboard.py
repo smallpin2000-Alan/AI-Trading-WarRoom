@@ -38,8 +38,13 @@ from src.core.engine import ContractSpec, EventDrivenEngine
 # AI 自動模擬操盤的預設單日最大虧損（元）
 DEFAULT_MAX_DAILY_LOSS = 5000.0
 from src.schema.strategy import StrategySchema
-from src.core.credibility_gate import run_credibility_gate
-from src.data.taifex_history import DailyHistoryUpdater
+from src.core.credibility_gate import run_orb_credibility_gate
+from src.data.taifex_history import DailyHistoryUpdater, history_path
+from src.core.orb_strategy import OrbParams, compute_orb_state
+from datetime import datetime, timedelta, timezone
+
+# 模擬倉使用的開盤區間突破參數（預設 30 分鐘區間）
+ORB_PARAMS = OrbParams()
 from src.ui.admin_gate import (
     FailedAttemptThrottle,
     get_admin_password,
@@ -282,8 +287,11 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
     """
     label = "🔄 解鎖並重新啟動操盤" if unlock_first else "▶ 啟動 AI 自動操盤"
     if st.button(label, key="btn_start_ai_trade", type="primary", disabled=not can_write):
-        with st.spinner("正在執行五道可信度檢核..."):
-            gate = run_credibility_gate(pt.strategy, pt.contract, pt.initial_capital, bars)
+        with st.spinner("正在以歷史資料回測開盤區間突破規則..."):
+            # 模擬倉進場由開盤區間突破規則決定：以期交所歷史 1 分 K 回測此規則作為檢核依據
+            hist_path = history_path("TMF")
+            hist = pl.read_parquet(hist_path) if hist_path.exists() else None
+            gate = run_orb_credibility_gate(hist, ORB_PARAMS, strategy=pt.strategy)
         if gate.passed:
             if unlock_first:
                 pt.reset_risk_locks(reset_daily_accounting=True)
@@ -297,7 +305,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
     gate = st.session_state.get("cred_gate_result")
     if gate is None:
         return
-    st.warning("⚠️ 策略未通過五道可信度檢核：")
+    st.warning("⚠️ 開盤區間突破規則未通過歷史資料可信度檢核：")
     for name, ok in gate.checks:
         st.caption(f"{'✅' if ok else '❌'} {name}")
     for reason in gate.reasons:
@@ -686,7 +694,7 @@ def main():
             else:
                 box_color = "#f0b90b"
                 bg_color = "rgba(240, 185, 11, 0.14)"
-            banner_title = advice.action_label
+            banner_title = f"{advice.action_label}（AI 分析僅供參考，不影響模擬倉下單）"
             banner_rationale = advice.rationale
 
         # AI 決策大橫幅卡片（整合台新 Nova API 量化三要素：【指標】➔【訊號】➔【方法】＋ 近期回測獲利因子）
@@ -800,63 +808,61 @@ def main():
         # ==================== 2.5 🤖 AI 自動模擬操盤帳戶面板 ====================
         pt = get_or_create_paper_trader("TMF")
 
-        # 🎯 徹底解耦：無論使用者在上方看什麼商品（台積電、鴻海、聯發科），
-        # 期貨模擬操盤帳戶永遠 100% 獨立專注於微台指 (TMFR1) 的真實 K 線與價格！
+        # 🎯 徹底解耦：無論使用者在上方看什麼商品，期貨模擬操盤帳戶永遠只看微台 (TMFR1) 的 K 線與價格
         feed_tmf_bars = df_bars
+        tmf_bars_1m = feed.get_bars(timeframe="1m", session="day_and_night") if (is_fut and "TMF" in clean_sym) else None
         tmf_curr_p = curr_price
         if not is_fut or "TMF" not in clean_sym:
             # 若目前看板顯示的不是微台，獨立載入 TMFR1 專屬最新 K 線與價格
             store_inst = feed.store or KBarStore()
             tmf_dict = store_inst.load_kbars_dict("TMFR1")
+            feed_tmf_bars = TaishinQuoteFeed._empty_bars_df()
+            tmf_curr_p = 0.0
             if tmf_dict:
-                feed_tmf_bars = TaishinQuoteFeed._empty_bars_df()
-                # 建立獨立的 TMFR1 5分K
                 tmf_feed_temp = TaishinQuoteFeed(auto_load_store=False)
                 tmf_feed_temp.kbars_1m = tmf_dict
                 tmf_feed_temp.symbol = "TMFR1"
                 feed_tmf_bars = tmf_feed_temp.get_bars("5m")
+                tmf_bars_1m = tmf_feed_temp.get_bars("1m")
                 last_tmf_dt = max(tmf_dict.keys())
                 tmf_curr_p = float(tmf_dict[last_tmf_dt]["close"])
 
         # 判斷台指期開盤狀態
         tmf_is_open, _ = FuturesAIAdvisor.get_market_session_status("TMF")
 
-        # 🛡️ 保鏢機制：只要有未平倉部位就檢核停損停利，不論自動操盤是否暫停或處於風控鎖定
-        # （價格是否屬於該商品由引擎內部的偏離比例防護把關）
-        if pt.position is not None and tmf_is_open and tmf_curr_p > 0:
-            stop_res = pt.check_position_stops(current_price=tmf_curr_p, df_bars=feed_tmf_bars)
-            if stop_res:
-                st.toast(f"⚡ 微台風控即時執行：{stop_res}", icon="🛡️")
+        # 📐 開盤區間突破 (ORB) 規則：模擬倉的多空方向完全由規則決定，AI 分析僅供參考
+        now_tw = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        orb = compute_orb_state(
+            tmf_bars_1m if tmf_bars_1m is not None else TaishinQuoteFeed._empty_bars_df(), now=now_tw, params=ORB_PARAMS
+        )
+        orb_label = {"BUY_LONG": "🟢 突破上緣：做多", "SELL_SHORT": "🔴 跌破下緣：做空"}.get(orb.action, "⚪ 觀望")
+        if orb.flatten:
+            orb_label = "⏰ 非進場時段（收盤前或夜盤，不開新倉、持倉強制平倉）"
+        range_txt = (
+            f"上緣 {orb.range_high:,.0f} ／ 下緣 {orb.range_low:,.0f}（寬 {orb.range_high - orb.range_low:,.0f} 點）"
+            if orb.range_high is not None else "開盤區間尚未形成"
+        )
+        st.markdown(
+            f"**📐 規則訊號（開盤區間突破，{ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘）**："
+            f"{orb_label} ｜ {range_txt} ｜ {orb.reason}"
+            + (f" ｜ 突破時間 {orb.breakout_ts:%H:%M} @ {orb.breakout_price:,.0f}" if orb.breakout_ts else "")
+        )
+        st.caption(
+            f"規則：區間完成後第一根收盤突破即進場，一天最多一次、不反手；{ORB_PARAMS.last_entry:%H:%M} 後不開新倉，"
+            f"{ORB_PARAMS.flatten_at:%H:%M} 強制平倉；停損停利沿用 ATR 設定。⚠️ 尚未經足夠歷史資料驗證。"
+        )
 
-        if pt.is_active and tmf_is_open and tmf_curr_p > 0:
-            # 🧠 取得微台專屬 AI 大腦趨勢出訊號
-            tmf_advice = advice
-            if not is_fut or "TMF" not in clean_sym:
-                try:
-                    tmf_advice = FuturesAIAdvisor.analyze_market(
-                        df_bars=feed_tmf_bars,
-                        symbol="TMF",
-                        timeframe="5m",
-                        gemini_api_key=default_cfg.get("gemini_api_key", ""),
-                        gemini_model=default_cfg.get("gemini_model", "gemini-3.5-flash-lite"),
-                        cloud_intel=None,
-                        fast_local_only=True,
-                    )
-                except Exception:
-                    logger.exception("微台 AI 決策分析失敗，本輪不撮合新倉")
-                    tmf_advice = None
-
-            if tmf_advice and tmf_advice.action != "WAIT":
-                trade_res = pt.sync_with_ai_advice(
-                    action=tmf_advice.action,
-                    confidence=tmf_advice.confidence,
-                    current_price=tmf_curr_p,
-                    df_bars=feed_tmf_bars,
-                    source_note=tmf_advice.source,
-                    min_confidence=60.0,
-                )
-                if trade_res:
-                    st.toast(f"⚡ 微台自動撮合：{trade_res}", icon="🤖")
+        # 🛡️ 停損停利、收盤強制平倉與規則進場（停損與平倉不受暫停或風控鎖定影響；價格防護由引擎把關）
+        if tmf_is_open and tmf_curr_p > 0 and (pt.position is not None or pt.is_active):
+            trade_res = pt.sync_with_rule_signal(
+                action=orb.action,
+                current_price=tmf_curr_p,
+                df_bars=feed_tmf_bars,
+                flatten=orb.flatten,
+                source_note="開盤區間突破",
+            )
+            if trade_res and trade_res != "系統暫停或風控鎖定中":
+                st.toast(f"⚡ 微台模擬倉：{trade_res}", icon="📐")
 
         # 操盤狀態橫幅卡（永遠綁定微台專屬即時價格 tmf_curr_p）
         unrealized_pnl = pt.get_unrealized_pnl(tmf_curr_p)

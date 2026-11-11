@@ -87,3 +87,16 @@ def test_failed_attempt_throttle_locks_and_recovers():
     assert throttle.seconds_until_unlock() == 60
     now[0] += 61.0
     assert not throttle.is_locked()
+
+
+def test_orb_gate_fails_with_too_few_trades():
+    from src.core.credibility_gate import run_orb_credibility_gate
+    res = run_orb_credibility_gate(_flat_noise_bars(100))
+    assert res.passed is False
+    assert any("交易筆數" in r for r in res.reasons)
+
+
+def test_orb_gate_handles_empty_data():
+    from src.core.credibility_gate import run_orb_credibility_gate
+    res = run_orb_credibility_gate(_flat_noise_bars(0))
+    assert res.passed is False

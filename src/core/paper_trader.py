@@ -207,6 +207,7 @@ class PaperTradingEngine:
         self._last_stop_out_dir: int = 0
         self._last_stop_out_bar_ts: Optional[datetime] = None
         self._last_entry_bar_ts: Optional[datetime] = None
+        self._last_entry_trading_day: Optional[str] = None  # 規則策略「一天只進場一次」的依據
 
     def _log(
         self,
@@ -436,6 +437,7 @@ class PaperTradingEngine:
         self._last_stop_out_dir = 0
         self._last_stop_out_bar_ts = None
         self._last_entry_bar_ts = None
+        self._last_entry_trading_day = None
         self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
         if save_to_disk:
             self.save_state_to_disk()
@@ -848,6 +850,69 @@ class PaperTradingEngine:
             return f"{closed_msg}成功開立 {dir_zh} {self.position.contracts} 口 @ {self.position.entry_price:,.1f}"
         return f"{closed_msg}新倉未成立（詳見風控日誌）" if closed_msg else None
 
+    def sync_with_rule_signal(
+        self,
+        action: Literal["BUY_LONG", "SELL_SHORT", "WAIT"],
+        current_price: float,
+        df_bars: pl.DataFrame,
+        flatten: bool,
+        source_note: str = "開盤區間突破",
+    ) -> Optional[str]:
+        """
+        依「規則訊號」（如開盤區間突破）驅動模擬倉：
+        1. 風控檢查與既有持倉的停損 / 停利永遠優先（不受暫停或鎖定影響）。
+        2. flatten=True（收盤前或日盤以外時段）時強制平倉，且不開新倉。
+        3. 一個交易日最多進場一次；持倉中收到反向訊號不反手。
+        """
+        if current_price <= 0:
+            return None
+        self.last_price = current_price
+
+        if self.check_daily_loss_limit(current_price) or self.check_daily_profit_target(current_price):
+            self.save_state_to_disk()
+            return "風控鎖定"
+
+        stop_res = self.check_position_stops(current_price, df_bars)
+        if stop_res:
+            return stop_res
+
+        if flatten:
+            if self.position is None:
+                return None
+            if not self._price_matches_position(current_price):
+                return None
+            tr = self._close_current_position(current_price, exit_idx=-1, reason="orb_time_exit")
+            msg = f"⏰ 收盤前強制平倉 @ {tr.exit_price:,.1f}，淨損益 {tr.net_pnl:+,.0f} 元（{source_note}不留倉）"
+            self._log("ORDER_FILL", msg, price=tr.exit_price, pnl=tr.net_pnl)
+            self.check_model_degradation()
+            self.save_state_to_disk()
+            return msg
+
+        if not self.is_active or self.kill_switch_locked or self.daily_loss_locked or self.daily_profit_locked or self.degradation_locked:
+            return "系統暫停或風控鎖定中"
+        if time.time() - self._last_reset_ts < RESET_GRACE_SEC:
+            return None
+
+        target_dir = 1 if action == "BUY_LONG" else -1 if action == "SELL_SHORT" else 0
+        if target_dir == 0 or self.position is not None:
+            return None  # 觀望；或已有持倉（同向續抱、反向不反手）
+        today = current_trading_day()
+        if self._last_entry_trading_day == today:
+            return None  # 一天只進場一次
+
+        atr_entry_val = (
+            read_atr_values(self._bars_with_exit_atr(df_bars), self.strategy, max(0, df_bars.height - 2))
+            if df_bars.height > 0 else {}
+        )
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        opened = self._open_new_position(target_dir, current_price, now_str, reason=f"規則訊號進場 ({source_note})", entry_atr=atr_entry_val)
+        if not opened:
+            return None
+        self._last_entry_trading_day = today
+        self.save_state_to_disk()
+        dir_zh = "多單" if target_dir == 1 else "空單"
+        return f"{source_note}：開立 {dir_zh} {self.position.contracts} 口 @ {self.position.entry_price:,.1f}"
+
     def save_state_to_disk(self, file_path: Optional[str | Path] = None) -> None:
         """將虛擬操盤帳戶狀態（資金、部位、已平倉交易、風控日誌）持久化儲存至本地磁碟"""
         p = Path(file_path) if file_path is not None else DEFAULT_STATE_PATH
@@ -884,6 +949,7 @@ class PaperTradingEngine:
             "last_stop_out_dir": self._last_stop_out_dir,
             "last_stop_out_bar_ts": _dt_to_str(self._last_stop_out_bar_ts),
             "last_entry_bar_ts": _dt_to_str(self._last_entry_bar_ts),
+            "last_entry_trading_day": self._last_entry_trading_day,
             "initial_capital": self.initial_capital,
             "realized_pnl": self.realized_pnl,
             "strategy": self.strategy.model_dump(),
@@ -939,6 +1005,7 @@ class PaperTradingEngine:
             self._last_stop_out_dir = int(data.get("last_stop_out_dir", 0) or 0)
             self._last_stop_out_bar_ts = _dt_from_str(data.get("last_stop_out_bar_ts"))
             self._last_entry_bar_ts = _dt_from_str(data.get("last_entry_bar_ts"))
+            self._last_entry_trading_day = data.get("last_entry_trading_day") or None
             self.initial_capital = data.get("initial_capital", self.initial_capital)
 
             strat_data = data.get("strategy")

@@ -98,3 +98,44 @@ def run_credibility_gate(
         checks=checks,
         bars_used=n_bars,
     )
+
+
+# ---------------------------------------------------------------------------
+# 開盤區間突破（ORB）規則的可信度檢核
+# ---------------------------------------------------------------------------
+ORB_MIN_TRADES = 60            # 一天最多一筆：至少約 3 個月的交易日
+ORB_MIN_PROFIT_FACTOR = 1.2
+
+
+def run_orb_credibility_gate(bars_1m: pl.DataFrame, params=None, strategy: StrategySchema | None = None) -> CredibilityGateResult:
+    """
+    以歷史 1 分 K 回測 ORB，四項全過才算通過：交易筆數足夠、獲利因子達標、前半段與後半段皆為正。
+    無法回測（資料不足或出錯）一律視為未通過。
+    """
+    from src.core.orb_strategy import OrbParams, backtest_orb
+
+    try:
+        trades = backtest_orb(bars_1m, params or OrbParams(), strategy=strategy) if bars_1m is not None and bars_1m.height else []
+    except Exception as ex:
+        logger.exception("開盤區間突破回測失敗")
+        return CredibilityGateResult(passed=False, reasons=[f"回測執行失敗：{ex}"])
+
+    pnl = [t["pnl_points"] for t in trades]
+    n = len(pnl)
+    gains = sum(v for v in pnl if v > 0)
+    losses = -sum(v for v in pnl if v <= 0)
+    pf = gains / losses if losses > 0 else (float("inf") if gains > 0 else 0.0)
+    half = n // 2
+    first, second = sum(pnl[:half]), sum(pnl[half:])
+
+    checks = [
+        (f"交易筆數 ≥ {ORB_MIN_TRADES}（目前 {n}）", n >= ORB_MIN_TRADES),
+        (f"獲利因子 ≥ {ORB_MIN_PROFIT_FACTOR}（目前 {pf:.2f}）", pf >= ORB_MIN_PROFIT_FACTOR),
+        (f"前半段淨利為正（{first:+.0f} 點）", n > 1 and first > 0),
+        (f"後半段淨利為正（{second:+.0f} 點）", n > 1 and second > 0),
+    ]
+    passed = all(ok for _, ok in checks)
+    reasons = [] if passed else [f"未通過：{name}" for name, ok in checks if not ok]
+    if passed:
+        reasons.append(f"開盤區間突破回測 {n} 筆、獲利因子 {pf:.2f}，前後半段皆獲利")
+    return CredibilityGateResult(passed=passed, reasons=reasons, checks=checks, bars_used=bars_1m.height if bars_1m is not None else 0)
