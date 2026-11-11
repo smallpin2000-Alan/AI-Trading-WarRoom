@@ -61,6 +61,8 @@ if [ ! -f "env.yaml" ]; then
   read -r -p "請輸入台新身分證字號 (SOL_USER_ID): " INPUT_SOL_ID
   read -r -s -p "請輸入台新密碼 (SOL_PASSWORD): " INPUT_SOL_PWD
   echo ""
+  read -r -s -p "請設定戰情室管理密碼 (WARROOM_ADMIN_PASSWORD，留空則任何訪客都能操作模擬倉): " INPUT_ADMIN_PWD
+  echo ""
   if [ -z "${EXISTING_GEMINI_KEY}" ]; then
     read -r -p "請輸入 GEMINI_API_KEY: " EXISTING_GEMINI_KEY
   else
@@ -73,6 +75,7 @@ SOL_PASSWORD: "${INPUT_SOL_PWD}"
 GEMINI_API_KEY: "${EXISTING_GEMINI_KEY}"
 GEMINI_MODEL: "gemini-2.5-flash"
 GCS_BUCKET: "${BUCKET_NAME}"
+WARROOM_ADMIN_PASSWORD: "${INPUT_ADMIN_PWD}"
 EOF
   echo "✅ 已建立 env.yaml！"
 fi

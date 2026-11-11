@@ -355,6 +355,7 @@ class FuturesAIAdvisor:
             macd_hist_s.alias("macd_hist"),
         ])
 
+        opens = df["open"].to_list()
         closes = df["close"].to_list()
         highs = df["high"].to_list()
         lows = df["low"].to_list()
@@ -950,6 +951,115 @@ class FuturesAIAdvisor:
 
         return None
 
+    # --- 對話框指令解析 -----------------------------------------------------
+    # 子句若帶有否定或疑問語氣，一律視為「詢問」而非「指令」，絕不執行帳戶操作
+    _CHAT_NEGATION_MARKERS = ("不要", "不用", "不必", "不可", "不能", "先不", "別", "勿")
+    _CHAT_QUESTION_MARKERS = (
+        "為什麼", "為何", "何時", "怎麼", "怎樣", "如何", "嗎", "是否", "會不會", "能不能", "可不可以", "什麼", "多少", "?", "？",
+    )
+    _CHAT_CMD_RESET = ("重置", "回10萬", "回到10萬", "歸零", "清空紀錄")
+    _CHAT_CMD_CLOSE = ("平倉", "出場", "砍單", "全平")
+    _CHAT_CMD_LOCK = ("鎖定下單", "下單鎖定", "鎖住下單")
+    _CHAT_CMD_UNLOCK_ORDER = ("解鎖下單", "下單解鎖")
+    _CHAT_CMD_UNLOCK_RISK = ("解除鎖定", "解除風控")
+    _CHAT_CMD_PAUSE = ("暫停操盤", "停止操盤", "暫停交易")
+    _CHAT_CMD_RESUME = ("啟動操盤", "開始操盤", "恢復操盤", "開始交易")
+    _CHAT_TP_PATTERN = re.compile(r"停利.*?(?:改|設|調).*?(\d+(?:\.\d+)?)")
+    _CHAT_TP_MAX_POINTS = 500.0
+    _CHAT_RESET_CAPITAL = 100_000.0
+
+    @classmethod
+    def _split_chat_clauses(cls, msg: str) -> List[str]:
+        """依標點切成子句（問號保留在所屬子句尾端，供語氣判斷使用）。"""
+        return [c.strip() for c in re.findall(r"[^，,。；;！!？?\n]+[？?]?", msg) if c.strip()]
+
+    @classmethod
+    def _is_non_imperative(cls, clause: str) -> bool:
+        return any(m in clause for m in cls._CHAT_NEGATION_MARKERS + cls._CHAT_QUESTION_MARKERS)
+
+    @classmethod
+    def _execute_chat_commands(cls, msg: str, paper_trader: Any, acct_price: float, unit: str) -> List[str]:
+        """
+        解析並執行對話框中的模擬倉操作指令，回傳要回報給使用者的訊息清單。
+        - 逐子句判斷：含否定 / 疑問語氣的子句不執行。
+        - 任何指令執行失敗都以訊息回報，不讓例外中斷對話。
+        """
+        results: List[str] = []
+        blocked = False
+
+        for clause in cls._split_chat_clauses(msg):
+            has = lambda keys: any(k in clause for k in keys)  # noqa: E731
+            tp_match = cls._CHAT_TP_PATTERN.search(clause)
+            is_command = tp_match is not None or any(
+                has(keys)
+                for keys in (
+                    cls._CHAT_CMD_RESET, cls._CHAT_CMD_CLOSE, cls._CHAT_CMD_LOCK, cls._CHAT_CMD_UNLOCK_ORDER,
+                    cls._CHAT_CMD_UNLOCK_RISK, cls._CHAT_CMD_PAUSE, cls._CHAT_CMD_RESUME,
+                )
+            )
+            if not is_command:
+                continue
+            if cls._is_non_imperative(clause):
+                blocked = True
+                continue
+
+            try:
+                if has(cls._CHAT_CMD_RESET):
+                    paper_trader.reset_all_simulation(initial_capital=cls._CHAT_RESET_CAPITAL)
+                    results.append(
+                        f"✅ **已為您執行【全部模擬重置】**：虛擬總權益已恢復為 **{cls._CHAT_RESET_CAPITAL:,.0f} 元**，"
+                        "所有未平倉部位與歷史紀錄已全數清空。"
+                    )
+                elif has(cls._CHAT_CMD_CLOSE):
+                    ok, close_msg = paper_trader.close_position_manually(acct_price, reason="對話框指令手動平倉")
+                    paper_trader.save_state_to_disk()
+                    if ok:
+                        results.append(f"✅ **已依指令執行平倉**：{close_msg}（風控鎖定與自動操盤開關維持原狀）")
+                    else:
+                        results.append(f"ℹ️ **未平倉**：{close_msg}")
+                elif has(cls._CHAT_CMD_LOCK):
+                    paper_trader.order_safety_locked = True
+                    paper_trader.save_state_to_disk()
+                    results.append("🔒 **已開啟【下單安全鎖】**：目前僅監控既有部位停損停利，暫停新開倉。")
+                elif has(cls._CHAT_CMD_UNLOCK_ORDER):
+                    paper_trader.order_safety_locked = False
+                    paper_trader.save_state_to_disk()
+                    results.append("⚡ **已解除【下單安全鎖】**（單日損益、Kill Switch 等風控鎖定不受影響）。")
+                elif has(cls._CHAT_CMD_UNLOCK_RISK):
+                    paper_trader.reset_risk_locks(reset_daily_accounting=True)
+                    paper_trader.save_state_to_disk()
+                    results.append("⚠️ **已解除風控鎖定並重新計算單日損益**；自動操盤不會自動恢復，需要時請輸入「啟動操盤」。")
+                elif has(cls._CHAT_CMD_PAUSE):
+                    flat_msg = paper_trader.stop_session(force_flat_price=acct_price)
+                    paper_trader.save_state_to_disk()
+                    results.append("⏸️ **已暫停 AI 自動模擬操盤**。" + (f" {flat_msg}" if flat_msg else ""))
+                elif has(cls._CHAT_CMD_RESUME):
+                    if not getattr(paper_trader, "credibility_verified", False):
+                        results.append("⛔ **未啟動**：策略尚未通過五道可信度檢核，請先在操盤面板執行檢核後再啟動。")
+                    else:
+                        ok, start_msg = paper_trader.start_session(credibility_passed=True)
+                        paper_trader.save_state_to_disk()
+                        results.append(f"▶️ **已啟動 AI 自動模擬操盤**：{start_msg}" if ok else f"⛔ **未啟動**：{start_msg}")
+
+                if tp_match is not None:
+                    new_tp_val = float(tp_match.group(1))
+                    if 0 <= new_tp_val <= cls._CHAT_TP_MAX_POINTS:
+                        paper_trader.custom_tp_points = new_tp_val
+                        paper_trader.save_state_to_disk()
+                        results.append(f"🎯 **已將【自動停利點數】調整為 `{new_tp_val:.0f} {unit}`**。")
+                    else:
+                        results.append(f"ℹ️ 停利點數需介於 0 ~ {cls._CHAT_TP_MAX_POINTS:.0f} {unit}，**未執行**調整。")
+            except Exception as ex:
+                print(f"FuturesAIAdvisor.chat_with_advisor 指令執行失敗: {ex!r}")
+                results.append(f"❌ **指令執行失敗**：{ex}")
+
+        if blocked and not results:
+            results.append(
+                "ℹ️ 您的訊息帶有疑問或否定語氣，為避免誤觸，**未執行**任何帳戶操作。"
+                "若確實要執行，請直接輸入指令，例如「平倉」、「重置回 10 萬」。"
+            )
+        return results
+
     @classmethod
     def chat_with_advisor(
         cls,
@@ -962,9 +1072,13 @@ class FuturesAIAdvisor:
         chat_history: Optional[list[dict[str, str]]] = None,
         gemini_api_key: str = "",
         gemini_model: str = "gemini-3.5-flash-lite",
+        trader_price: Optional[float] = None,
+        allow_commands: bool = True,
     ) -> str:
         """
         戰情室網頁即時對話顧問 (Interactive Web Copilot)：
+        - current_price 為看板目前顯示商品的報價；trader_price 為模擬倉所屬商品（微台）的報價，
+          所有帳戶操作與損益計算一律使用 trader_price（未提供時才退回 current_price）。
         - 支援直接在對話框輸入自然語言指令（如：「重置10萬」、「平倉」、「停利改50點」、「為什麼沒交易」、「支撐壓力在哪」）。
         - 自動結合當下 K 線指標、6 大戰法共振與模擬倉持倉損益進行回答。
         """
@@ -976,46 +1090,23 @@ class FuturesAIAdvisor:
         unit = "點" if is_fut else "元"
         executed_actions: list[str] = []
 
-        # 1. 檢查是否包含可直接執行的模擬倉操作指令
-        if paper_trader is not None:
-            if any(k in msg for k in ["重置", "回10萬", "回到10萬", "歸零", "清空紀錄"]):
-                paper_trader.reset_all_simulation(initial_capital=100_000.0)
-                executed_actions.append("✅ **已為您執行【全部模擬重置】**：虛擬總權益已恢復為 **100,000 元**，所有未平倉部位與歷史紀錄已全數清空。")
-            elif any(k in msg for k in ["平倉", "出場", "砍單", "全平"]) and not any(k in msg for k in ["為什麼", "何時", "怎麼"]):
-                if paper_trader.position is not None and current_price > 0:
-                    res_close = paper_trader.trigger_kill_switch(current_price, reason="對話框指令手動平倉")
-                    paper_trader.reset_risk_locks(reset_daily_accounting=False)
-                    paper_trader.is_active = True
-                    paper_trader.save_state_to_disk()
-                    executed_actions.append(f"✅ **已依指令執行平倉**：{res_close}")
-                else:
-                    executed_actions.append("ℹ️ 目前帳戶為**空手 (無未平倉部位)**，無須執行平倉。")
-            elif any(k in msg for k in ["鎖定下單", "下單鎖定", "鎖住下單"]):
-                paper_trader.order_safety_locked = True
-                paper_trader.save_state_to_disk()
-                executed_actions.append("🔒 **已開啟【下單安全鎖】**：目前僅監控既有部位停損停利，暫停新開倉。")
-            elif any(k in msg for k in ["解鎖下單", "下單解鎖", "解除鎖定"]):
-                paper_trader.order_safety_locked = False
-                paper_trader.reset_risk_locks(reset_daily_accounting=True)
-                paper_trader.save_state_to_disk()
-                executed_actions.append("⚡ **已解除【下單安全鎖與風控鎖定】**：系統已恢復正常跟隨 AI 訊號自動操盤。")
-            elif any(k in msg for k in ["暫停操盤", "停止操盤", "暫停交易"]):
-                paper_trader.stop_monitoring(current_price)
-                paper_trader.save_state_to_disk()
-                executed_actions.append("⏸️ **已暫停 AI 自動模擬操盤**。")
-            elif any(k in msg for k in ["啟動操盤", "開始操盤", "恢復操盤", "開始交易"]):
-                paper_trader.start_monitoring()
-                paper_trader.save_state_to_disk()
-                executed_actions.append("▶️ **已啟動 AI 自動模擬操盤**。")
+        # 模擬倉永遠綁定自己的商品（微台）報價；看板顯示其他商品時，不可拿看板價格去撮合或計算損益
+        acct_price = trader_price if (trader_price is not None and trader_price > 0) else current_price
 
-            # 檢查「停利改 XX 點」
-            m_tp = re.search(r"停利.*?(?:改|設|調).*?(\d+(?:\.\d+)?)", msg)
-            if m_tp:
-                new_tp_val = float(m_tp.group(1))
-                if 0 <= new_tp_val <= 500:
-                    paper_trader.custom_tp_points = new_tp_val
-                    paper_trader.save_state_to_disk()
-                    executed_actions.append(f"🎯 **已將【自動停利點數】調整為 `{new_tp_val:.0f} {unit}`**。")
+        # 1. 檢查是否包含可直接執行的模擬倉操作指令
+        if paper_trader is not None and allow_commands:
+            executed_actions = cls._execute_chat_commands(msg, paper_trader, acct_price, unit)
+            current_price_for_account = acct_price
+        else:
+            current_price_for_account = current_price
+        if paper_trader is not None and not allow_commands:
+            if any(
+                k in msg for keys in (
+                    cls._CHAT_CMD_RESET, cls._CHAT_CMD_CLOSE, cls._CHAT_CMD_LOCK, cls._CHAT_CMD_UNLOCK_ORDER,
+                    cls._CHAT_CMD_UNLOCK_RISK, cls._CHAT_CMD_PAUSE, cls._CHAT_CMD_RESUME,
+                ) for k in keys
+            ) or cls._CHAT_TP_PATTERN.search(msg):
+                executed_actions = ["🔐 目前為唯讀模式，**未執行**任何帳戶操作；請先輸入管理密碼解鎖。"]
 
         # 2. 整理當前盤勢與帳戶狀態摘要
         pos_desc = "目前空手 (0 口)"
@@ -1023,8 +1114,8 @@ class FuturesAIAdvisor:
         realized_str = "+0 元"
         trades_cnt = 0
         if paper_trader is not None:
-            eq_val = paper_trader.get_total_equity(current_price)
-            ur_val = paper_trader.get_unrealized_pnl(current_price)
+            eq_val = paper_trader.get_total_equity(current_price_for_account)
+            ur_val = paper_trader.get_unrealized_pnl(current_price_for_account)
             rl_val = paper_trader.realized_pnl
             equity_str = f"{eq_val:,.0f} 元"
             realized_str = f"{rl_val:+,.0f} 元"

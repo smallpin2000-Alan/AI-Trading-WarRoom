@@ -36,3 +36,30 @@ def test_add_symbol_auto_resolves_name(tmp_path):
     ok2, _, items2 = add_symbol_to_watchlist("2382", "", path=wl_file)
     assert ok2 is True
     assert items2[0] == "2382 (廣達)"
+
+
+def test_save_disk_cache_is_atomic_and_logs_errors(tmp_path, monkeypatch, caplog):
+    import json
+    import logging
+    import src.data.symbol_lookup as sl
+
+    cache_file = tmp_path / "cfg" / "symbol_names_cache.json"
+    monkeypatch.setattr(sl, "CACHE_PATH", cache_file)
+    monkeypatch.setitem(sl._memory_cache, "9999", "測試股")
+    sl._save_disk_cache()
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["9999"] == "測試股"
+    assert [p.name for p in cache_file.parent.iterdir()] == ["symbol_names_cache.json"]
+
+    # 取代失敗：舊檔保持完整、暫存檔清除、例外被記錄而非靜默吞掉
+    before = cache_file.read_bytes()
+
+    def boom(src, dst):
+        raise PermissionError("file in use")
+
+    monkeypatch.setattr(sl.os, "replace", boom)
+    monkeypatch.setitem(sl._memory_cache, "8888", "另一檔")
+    with caplog.at_level(logging.WARNING, logger="src.data.symbol_lookup"):
+        sl._save_disk_cache()
+    assert cache_file.read_bytes() == before
+    assert [p.name for p in cache_file.parent.iterdir()] == ["symbol_names_cache.json"]
+    assert any("symbol_names_cache" in r.getMessage() or "快取" in r.getMessage() for r in caplog.records)

@@ -81,14 +81,48 @@ def test_multi_model_ensemble_and_threshold_scan():
         assert dec.total_active_models >= 6
         assert dec.final_action in (-1, 0, 1)
         assert 0.0 <= dec.ensemble_long_conf <= 100.0
+        assert 0.0 <= dec.ensemble_short_conf <= 100.0
+        # 票數只來自各子模型的實際訊號，且三類票數加總等於啟用模型數
+        active = [m for m in dec.models if m.enabled]
+        assert dec.bull_votes == sum(1 for m in active if m.latest_signal == 1)
+        assert dec.bear_votes == sum(1 for m in active if m.latest_signal == -1)
+        assert dec.bull_votes + dec.bear_votes + dec.neutral_votes == dec.total_active_models
+        # 最終動作必須至少有一個子模型在該方向有實際訊號
+        if dec.final_action == 1:
+            assert dec.bull_votes >= 1
+        elif dec.final_action == -1:
+            assert dec.bear_votes >= 1
+        assert sum(m.dynamic_weight for m in active) == pytest.approx(1.0, abs=0.01)
 
-    strat = dec.models[0].strategy
-    scan_rows = MultiModelEnsemble.scan_threshold_tradeoff(
-        df, strat, contract, thresholds=[50.0, 65.0, 80.0]
-    )
-    assert len(scan_rows) == 3
-    # 高門檻的交易次數應小於或等於低門檻
-    assert scan_rows[-1].total_trades <= scan_rows[0].total_trades
+    # 使用會頻繁交叉的震盪資料，確保門檻掃描真的有在過濾（避免 0 <= 0 之類的空洞斷言）
+    n = 200
+    prices = [20000.0 + i * 2.0 + np.sin(i / 3.0) * 60.0 for i in range(n)]
+    chop_df = pl.DataFrame({
+        "timestamp": [datetime(2026, 10, 20, 9, 0) + timedelta(minutes=5 * i) for i in range(n)],
+        "open": [p - 3.0 for p in prices],
+        "high": [p + 12.0 for p in prices],
+        "low": [p - 10.0 for p in prices],
+        "close": prices,
+        "volume": [100 + (i % 7) * 30 for i in range(n)],
+    })
+    strat = StrategySchema.model_validate({
+        "id": "scan_test", "version": 1, "timeframe": "5m",
+        "indicators": {
+            "fast_ma": {"type": "SMA", "source": "close", "length": 3},
+            "slow_ma": {"type": "SMA", "source": "close", "length": 8},
+        },
+        "entry_long": {"cross_above": ["fast_ma", "slow_ma"]},
+        "entry_short": {"cross_below": ["fast_ma", "slow_ma"]},
+        "exit": {"stop_loss": {"type": "fixed_points", "value": 40.0}},
+    })
+    thresholds = [1.0, 50.0, 65.0, 80.0, 99.0]
+    scan_rows = MultiModelEnsemble.scan_threshold_tradeoff(chop_df, strat, contract, thresholds=thresholds)
+    assert [r.threshold for r in scan_rows] == thresholds
+    trades = [r.total_trades for r in scan_rows]
+    # 門檻越高交易次數單調不增，且低門檻確實有交易、高門檻確實被濾掉
+    assert all(a >= b for a, b in zip(trades, trades[1:]))
+    assert trades[0] > 0
+    assert trades[-1] < trades[0]
 
 
 def test_walk_forward_and_parameter_wizard():

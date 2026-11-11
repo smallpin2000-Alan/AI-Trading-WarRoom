@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import gc
 import json
+import logging
 import time
 import threading
 from pathlib import Path
@@ -21,6 +22,15 @@ from src.data.symbol_lookup import get_symbol_name, format_symbol_display
 from src.core.paper_trader import PaperTradingEngine, RiskConfig, OpenPosition
 from src.core.engine import ContractSpec
 from src.schema.strategy import StrategySchema
+from src.core.credibility_gate import run_credibility_gate
+from src.ui.admin_gate import (
+    FailedAttemptThrottle,
+    get_admin_password,
+    is_protection_enabled,
+    verify_admin_password,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def load_taishin_default_config() -> dict:
@@ -216,6 +226,88 @@ def remove_symbol_from_watchlist(target_entry: str, path: str | Path = "config/w
     return True, f"已從自選清單移除 `{target_entry}`。", items
 
 
+@st.cache_resource
+def _get_admin_throttle() -> FailedAttemptThrottle:
+    """全站共用的管理密碼錯誤次數節流器"""
+    return FailedAttemptThrottle()
+
+
+def render_admin_gate() -> bool:
+    """
+    顯示管理密碼解鎖區塊，回傳目前 session 是否可執行「寫入類」操作。
+    未設定 WARROOM_ADMIN_PASSWORD 時不擋（維持舊行為），但顯示提醒。
+    """
+    if not is_protection_enabled():
+        st.caption("⚠️ 尚未設定管理密碼（環境變數 WARROOM_ADMIN_PASSWORD），任何訪客都能操作模擬倉；公開部署時強烈建議設定。")
+        return True
+    if st.session_state.get("warroom_admin_ok"):
+        if st.button("🔐 登出管理權限", key="btn_admin_logout"):
+            st.session_state["warroom_admin_ok"] = False
+            st.rerun()
+        return True
+
+    throttle = _get_admin_throttle()
+    with st.expander("🔐 輸入管理密碼以操作模擬倉（目前為唯讀模式）"):
+        if throttle.is_locked():
+            st.error(f"密碼錯誤次數過多，請 {throttle.seconds_until_unlock()} 秒後再試。")
+            return False
+        pwd = st.text_input("管理密碼", type="password", key="in_admin_pwd")
+        if st.button("解鎖", key="btn_admin_login"):
+            if verify_admin_password(pwd, get_admin_password()):
+                st.session_state["warroom_admin_ok"] = True
+                st.rerun()
+            else:
+                throttle.record_failure()
+                logger.warning("戰情室管理密碼驗證失敗")
+                st.error("密碼錯誤")
+    return False
+
+
+def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_first: bool, can_write: bool) -> None:
+    """
+    「啟動 / 解鎖並重新啟動」流程：
+    先實際執行五道可信度檢核；通過即啟動。
+    未通過時列出各項結果，使用者必須勾選「僅限模擬倉、已了解未通過」才可確認啟動（並寫入稽核日誌）。
+    """
+    label = "🔄 解鎖並重新啟動操盤" if unlock_first else "▶ 啟動 AI 自動操盤"
+    if st.button(label, key="btn_start_ai_trade", type="primary", disabled=not can_write):
+        with st.spinner("正在執行五道可信度檢核..."):
+            gate = run_credibility_gate(pt.strategy, pt.contract, pt.initial_capital, bars)
+        if gate.passed:
+            if unlock_first:
+                pt.reset_risk_locks(reset_daily_accounting=True)
+            succ, msg = pt.start_session(credibility_passed=True)
+            pt.save_state_to_disk()
+            st.session_state.pop("cred_gate_result", None)
+            (st.success if succ else st.error)(msg)
+            st.rerun()
+        st.session_state["cred_gate_result"] = gate
+
+    gate = st.session_state.get("cred_gate_result")
+    if gate is None:
+        return
+    st.warning("⚠️ 策略未通過五道可信度檢核：")
+    for name, ok in gate.checks:
+        st.caption(f"{'✅' if ok else '❌'} {name}")
+    for reason in gate.reasons:
+        st.caption(f"・{reason}")
+    confirmed = st.checkbox("我了解此策略未通過檢核，僅限模擬倉啟動", key="chk_cred_override")
+    c_ok, c_cancel = st.columns(2)
+    with c_ok:
+        if st.button("確認啟動", key="btn_cred_override", disabled=not (confirmed and can_write)):
+            if unlock_first:
+                pt.reset_risk_locks(reset_daily_accounting=True)
+            succ, msg = pt.start_session(credibility_passed=False, simulation_override=True)
+            pt.save_state_to_disk()
+            st.session_state.pop("cred_gate_result", None)
+            (st.warning if succ else st.error)(msg)
+            st.rerun()
+    with c_cancel:
+        if st.button("取消", key="btn_cred_cancel"):
+            st.session_state.pop("cred_gate_result", None)
+            st.rerun()
+
+
 APP_VERSION = "v2.8.4"
 _refreshing_advice_keys: set[str] = set()
 
@@ -310,7 +402,13 @@ def main():
 
     with ctrl_c4:
         st.write("")
-        manual_trigger = st.button("🚀 連線 / 重新 AI 分析", type="primary", width="stretch")
+        # 會觸發台新登入／重連，屬於需管理權限的操作（避免訪客反覆按造成登入風暴）
+        manual_trigger = st.button(
+            "🚀 連線 / 重新 AI 分析",
+            type="primary",
+            width="stretch",
+            disabled=not st.session_state.get("warroom_can_write", not is_protection_enabled()),
+        )
 
     # 當使用者切換下拉選單商品時，自動熱切換訂閱標的並載入新商品 K 線
     if clean_sym and feed.symbol != clean_sym:
@@ -358,7 +456,7 @@ def main():
             )
         with wl_c3:
             st.write("")
-            if st.button("➕ 新增商品", width="stretch", type="primary"):
+            if st.button("➕ 新增商品", width="stretch", type="primary", disabled=not st.session_state.get("warroom_can_write", not is_protection_enabled())):
                 effective_note = new_sym_note.strip() if new_sym_note.strip() else detected_name
                 ok_add, msg_add, updated_list = add_symbol_to_watchlist(new_sym_code, effective_note)
                 if ok_add:
@@ -369,7 +467,7 @@ def main():
                     st.warning(msg_add)
         with wl_c4:
             st.write("")
-            if st.button(f"🗑️ 移除目前商品 ({clean_sym})", width="stretch"):
+            if st.button(f"🗑️ 移除目前商品 ({clean_sym})", width="stretch", disabled=not st.session_state.get("warroom_can_write", not is_protection_enabled())):
                 ok_rm, msg_rm, updated_list = remove_symbol_from_watchlist(ts_symbol)
                 if ok_rm:
                     st.session_state["selected_watchlist_item"] = updated_list[0]
@@ -426,16 +524,27 @@ def main():
                 advice = cached_entry[2]
             else:
                 # 首次載入或 K 棒已推進：0.005 秒極速重算台新三積木（均線+布林+MACD+ATR）多空決策，絕不卡畫面！
-                advice = FuturesAIAdvisor.analyze_market(
-                    df_bars=df_bars,
-                    symbol=clean_sym,
-                    timeframe=chart_tf,
-                    gemini_api_key=default_cfg.get("gemini_api_key", ""),
-                    gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
-                    cloud_intel=intel_snap,
-                    fast_local_only=True,
-                )
-                global_advice_cache[advice_key] = (0.0, bar_sig, advice)
+                try:
+                    advice = FuturesAIAdvisor.analyze_market(
+                        df_bars=df_bars,
+                        symbol=clean_sym,
+                        timeframe=chart_tf,
+                        gemini_api_key=default_cfg.get("gemini_api_key", ""),
+                        gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
+                        cloud_intel=intel_snap,
+                        fast_local_only=True,
+                    )
+                    global_advice_cache[advice_key] = (0.0, bar_sig, advice)
+                except Exception as ex:
+                    # AI 分析失敗不可拖垮整個戰情室（後面的模擬倉停損檢核仍必須執行）
+                    logger.exception("AI 決策分析失敗 (%s %s)", clean_sym, chart_tf)
+                    st.error(f"⚠️ AI 決策分析暫時失敗：{ex}（模擬倉停損守護不受影響）")
+                    advice = (
+                        cached_entry[2]
+                        if cached_entry is not None
+                        # df_bars=None 會走「資料不足、建議觀望」的安全分支，不會再拋例外
+                        else FuturesAIAdvisor.analyze_market(None, symbol=clean_sym, timeframe=chart_tf)
+                    )
 
             # 背景執行緒非阻塞呼叫 Gemini 2.5 Flash 深度分析 (僅在開盤交易時段執行，收盤後不再重複呼叫預估)
             if is_mkt_open and advice_key not in _refreshing_advice_keys and df_bars.height >= 10:
@@ -684,24 +793,30 @@ def main():
         # 判斷台指期開盤狀態
         tmf_is_open, _ = FuturesAIAdvisor.get_market_session_status("TMF")
 
-        if pt.is_active and tmf_is_open and tmf_curr_p > 10000:
-            # 🛡️ 方案B保鏢機制：每 15 秒獨立執行微台專屬即時停損停利檢核
+        # 🛡️ 保鏢機制：只要有未平倉部位就檢核停損停利，不論自動操盤是否暫停或處於風控鎖定
+        # （價格是否屬於該商品由引擎內部的偏離比例防護把關）
+        if pt.position is not None and tmf_is_open and tmf_curr_p > 0:
             stop_res = pt.check_position_stops(current_price=tmf_curr_p, df_bars=feed_tmf_bars)
             if stop_res:
                 st.toast(f"⚡ 微台風控即時執行：{stop_res}", icon="🛡️")
 
+        if pt.is_active and tmf_is_open and tmf_curr_p > 0:
             # 🧠 取得微台專屬 AI 大腦趨勢出訊號
             tmf_advice = advice
             if not is_fut or "TMF" not in clean_sym:
-                tmf_advice = FuturesAIAdvisor.analyze_market(
-                    df_bars=feed_tmf_bars,
-                    symbol="TMF",
-                    timeframe="5m",
-                    gemini_api_key=default_cfg.get("gemini_api_key", ""),
-                    gemini_model=default_cfg.get("gemini_model", "gemini-3.5-flash-lite"),
-                    cloud_intel=None,
-                    fast_local_only=True,
-                )
+                try:
+                    tmf_advice = FuturesAIAdvisor.analyze_market(
+                        df_bars=feed_tmf_bars,
+                        symbol="TMF",
+                        timeframe="5m",
+                        gemini_api_key=default_cfg.get("gemini_api_key", ""),
+                        gemini_model=default_cfg.get("gemini_model", "gemini-3.5-flash-lite"),
+                        cloud_intel=None,
+                        fast_local_only=True,
+                    )
+                except Exception:
+                    logger.exception("微台 AI 決策分析失敗，本輪不撮合新倉")
+                    tmf_advice = None
 
             if tmf_advice and tmf_advice.action != "WAIT":
                 trade_res = pt.sync_with_ai_advice(
@@ -750,26 +865,15 @@ def main():
         """, unsafe_allow_html=True)
 
         # 操盤控制按鈕與緊急平倉
+        can_write = render_admin_gate()
+        st.session_state["warroom_can_write"] = can_write
         ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns([1.2, 1.2, 1.1, 1.1, 1.6])
         with ctrl_col1:
             if not pt.is_active:
-                if pt.daily_loss_locked or pt.kill_switch_locked or pt.degradation_locked:
-                    if st.button("🔄 解鎖並重新啟動操盤", key="btn_restart_ai_trade", type="primary", help="解除單日虧損/熔斷鎖定，並重置本日新回合風控門檻重新開始操盤"):
-                        pt.reset_risk_locks(reset_daily_accounting=True)
-                        succ, msg = pt.start_session(credibility_passed=True)
-                        pt.save_state_to_disk()
-                        if succ:
-                            st.success(f"✅ {msg}")
-                        else:
-                            st.error(f"❌ {msg}")
-                        st.rerun()
-                else:
-                    if st.button("▶ 啟動 AI 自動操盤", key="btn_start_ai_trade", type="primary"):
-                        succ, msg = pt.start_session(credibility_passed=True)
-                        pt.save_state_to_disk()
-                        st.rerun()
+                unlock_first = pt.daily_loss_locked or pt.daily_profit_locked or pt.kill_switch_locked or pt.degradation_locked
+                render_credibility_start(pt, feed_tmf_bars, unlock_first=unlock_first, can_write=can_write)
             else:
-                if st.button("⏸ 暫停自動操盤", key="btn_stop_ai_trade"):
+                if st.button("⏸ 暫停自動操盤", key="btn_stop_ai_trade", disabled=not can_write):
                     flat_msg = pt.stop_session(force_flat_price=tmf_curr_p)
                     pt.save_state_to_disk()
                     if flat_msg:
@@ -780,18 +884,18 @@ def main():
             is_locked = getattr(pt, "order_safety_locked", False)
             btn_lock_label = "🔒 下單已鎖定 (點此解鎖)" if is_locked else "⚡ 下單已解鎖 (點此鎖定)"
             btn_lock_type = "secondary" if is_locked else "primary"
-            if st.button(btn_lock_label, key="btn_toggle_order_lock", type=btn_lock_type, help="鎖定時僅能執行平倉與風控，嚴格禁止開立新倉"):
+            if st.button(btn_lock_label, key="btn_toggle_order_lock", type=btn_lock_type, disabled=not can_write, help="鎖定時僅能執行平倉與風控，嚴格禁止開立新倉"):
                 pt.order_safety_locked = not is_locked
                 pt.save_state_to_disk()
                 st.rerun()
         with ctrl_col3:
-            if st.button("🚨 一鍵緊急平倉 (Kill)", key="btn_kill_switch", help="立即市價平掉所有部位並鎖定系統"):
+            if st.button("🚨 一鍵緊急平倉 (Kill)", key="btn_kill_switch", disabled=not can_write, help="立即市價平掉所有部位並鎖定系統"):
                 kill_msg = pt.trigger_kill_switch(current_price=tmf_curr_p)
                 pt.save_state_to_disk()
                 st.warning(kill_msg)
                 st.rerun()
         with ctrl_col4:
-            if st.button("🧹 全部模擬重置 (回10萬)", key="btn_reset_all_sim", help="清空所有持倉、歷史成交紀錄與損益，將虛擬總權益恢復為初始 100,000 元"):
+            if st.button("🧹 全部模擬重置 (回10萬)", key="btn_reset_all_sim", disabled=not can_write, help="清空所有持倉、歷史成交紀錄與損益，將虛擬總權益恢復為初始 100,000 元"):
                 pt.reset_all_simulation(initial_capital=100_000.0)
                 st.toast("🔄 模擬帳戶已完全重置，本金恢復 100,000 元！", icon="🧹")
                 st.rerun()
@@ -823,7 +927,7 @@ def main():
             with sc6:
                 st.write("")
                 st.write("")
-                if st.button("💾 儲存設定", key="btn_save_user_strategy", type="secondary"):
+                if st.button("💾 儲存設定", key="btn_save_user_strategy", type="secondary", disabled=not can_write):
                     from src.schema.strategy import StopLossSpec, TrailingStopSpec
                     pt.strategy.exit.stop_loss = StopLossSpec(type="fixed_points", value=float(new_sl))
                     pt.custom_tp_points = float(new_tp)
@@ -834,6 +938,9 @@ def main():
                     pt.strategy.exit.trailing_stop = TrailingStopSpec(type="points", value=float(new_ts), activation_points=float(new_ts))
                     pt.risk_config.max_contracts = int(new_max_c)
                     pt.risk_config.max_daily_loss = float(new_daily_loss)
+                    # 出場參數已變更：先前的可信度檢核結果不再適用於這組新參數
+                    pt.credibility_verified = False
+                    pt._log("SYSTEM", f"使用者修改策略參數（停損 {new_sl:.0f} / 停利 {new_tp:.0f} / 移動鎖利 {new_ts:.0f} 點），可信度檢核需重新執行")
                     pt.save_state_to_disk()
                     st.success("✅ 策略參數與口數上限已即時套用儲存！")
                     st.rerun()
@@ -926,9 +1033,12 @@ def main():
                             chat_history=st.session_state["war_room_chat_history"][:-1],
                             gemini_api_key=default_cfg.get("gemini_api_key", ""),
                             gemini_model=default_cfg.get("gemini_model", "gemini-2.5-flash"),
+                            trader_price=tmf_curr_p,
+                            allow_commands=st.session_state.get("warroom_can_write", False),
                         )
                     st.session_state["war_room_chat_history"].append({"role": "assistant", "content": reply_text})
-                    if any(k in active_msg for k in ["重置", "回10萬", "平倉", "出場", "砍單", "停利", "鎖定", "解鎖", "暫停", "啟動"]):
+                    # 只有實際改變帳戶狀態（回覆開頭為 ✅/🔒/⚡/⚠️/⏸️/▶️/🎯）時才整頁刷新，讓上方帳戶面板同步
+                    if reply_text.startswith(("✅", "🔒", "⚡", "⚠️", "⏸️", "▶️", "🎯")):
                         st.rerun()
 
                 # 顯示最近 8 則對話訊息（最新對話立即呈現在最下方）

@@ -209,10 +209,19 @@ class EventDrivenEngine:
             exit_reason=reason,
         )
 
-    def run_backtest(self, df: pl.DataFrame, cost_multiplier: float = 1.0) -> BacktestReport:
-        # 1. 預先計算指標與 AI 信心度序列
+    def run_backtest(
+        self,
+        df: pl.DataFrame,
+        cost_multiplier: float = 1.0,
+        trade_start_idx: int = 0,
+    ) -> BacktestReport:
+        """
+        trade_start_idx：在此索引之前的 K 棒只用來暖機指標，不建立任何新倉
+        （供 OOS / Walk-Forward 切片使用，避免暖機緩衝區的交易被算進樣本外績效）。
+        """
+        # 1. 預先計算指標與 AI 信心度序列（指標若宣告較大的 timeframe，會以主週期重採樣且只用已收盤的高週期 K 棒）
         ind_specs = {k: v.model_dump() for k, v in self.strategy.indicators.items()}
-        df_ind = IndicatorEngine.compute_indicators(df, ind_specs)
+        df_ind = IndicatorEngine.compute_indicators(df, ind_specs, base_timeframe=self.strategy.timeframe)
         cf_spec = self.strategy.confidence_filter
         if cf_spec.enabled:
             df_ind = ConfidenceEngine.compute_confidence_series(
@@ -263,12 +272,14 @@ class EventDrivenEngine:
                     realized_equity += tr.net_pnl
                     pos_dir = 0
 
-                # 若目標為建新倉 (1 或 -1)
-                if target_dir != 0:
+                # 若目標為建新倉 (1 或 -1)；暖機區段 (i < trade_start_idx) 與權益歸零後一律不建倉
+                if target_dir != 0 and i >= trade_start_idx and realized_equity > 0:
                     cand_entry_price = o + slippage if target_dir == 1 else o - slippage
                     # 讀取進場前一根收盤 (或當根) 之 ATR
                     atr_now = read_atr_values(cols, self.strategy, max(0, i - 1))
-                    can_open, err_msg = can_open_position(self.strategy, cand_entry_price, atr_now)
+                    can_open, err_msg = can_open_position(
+                        self.strategy, cand_entry_price, atr_now, direction=target_dir
+                    )
                     if can_open:
                         calc_contracts = compute_contracts(
                             self.strategy,
@@ -276,6 +287,8 @@ class EventDrivenEngine:
                             self.contract.point_value,
                             cand_entry_price,
                             atr_now,
+                            # 保證金檢查：已實現權益不足以支付 口數 × 原始保證金 時降口數，降到 0 則不進場
+                            initial_margin=self.contract.initial_margin,
                         )
                         if calc_contracts > 0:
                             pos_dir = target_dir
@@ -403,6 +416,10 @@ class EventDrivenEngine:
                 pos_dir, contracts, entry_idx, n_bars - 1, entry_price, fill_exit, "end_of_data", cost_multiplier
             )
             trades.append(tr)
+            realized_equity += tr.net_pnl
+            # 補上結算後的最後一個權益點，讓權益曲線終值 = 本金 + 所有交易淨損益
+            # （因此有 end_of_data 交易時，equity_curve 長度為 K 棒數 + 1）
+            equity_curve.append(realized_equity)
 
         return self._build_report(trades, equity_curve)
 

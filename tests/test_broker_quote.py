@@ -68,7 +68,8 @@ def test_taishin_quote_feed_on_match_and_snapshot_callbacks():
     assert bars.height == 1
     assert bars["open"][0] == 2380.0
     assert bars["close"][0] == 2385.0
-    assert bars["volume"][0] == 15
+    # 快照只更新價格、不重複計量：成交量只計 OnMatch 的 10 口
+    assert bars["volume"][0] == 10
 
 
 def test_taishin_tech_analysis_kbar_callbacks():
@@ -155,7 +156,7 @@ def test_taishin_switch_symbol_clears_old_data_and_loads_new(tmp_path):
 
 def test_market_stats_summary_and_tick_velocity():
     """測試當日開高低昨收、漲跌停、Tick 流速與內外盤力道計算"""
-    feed = TaishinQuoteFeed()
+    feed = TaishinQuoteFeed(store_dir=None)
     feed.symbol = "TMFR1"
 
     t1 = datetime(2026, 11, 10, 9, 0, 0)

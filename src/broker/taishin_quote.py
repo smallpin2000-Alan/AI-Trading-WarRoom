@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import logging
 import datetime
 import threading
 from pathlib import Path
@@ -14,7 +15,22 @@ from src.core.bar_builder import TickData, SharedBarBuilder
 from src.data.kbar_store import KBarStore
 
 
+logger = logging.getLogger(__name__)
+
 TZ_TW = datetime.timezone(datetime.timedelta(hours=8))
+
+# 異常值判斷：K 棒價格與鄰近 K 棒收盤價中位數相比，偏離超過此比例才剔除（期貨與個股共用）
+# 台股單日漲跌停 10%，同日最大振幅約 22%，取 25% 可確保正常行情（含跨日跳空）不被誤殺
+OUTLIER_MAX_DEVIATION_RATIO = 0.25
+OUTLIER_NEIGHBOR_WINDOW = 10   # 前後各取幾根鄰近 K 棒
+OUTLIER_MIN_NEIGHBORS = 3      # 鄰近 K 棒不足此數時不做偏離判斷（僅檢查欄位有效性）
+
+# Tick 時間與本機時鐘可容許的誤差；超過此誤差的「未來時間」視為前一日（跨午夜）
+TICK_CLOCK_SKEW_TOLERANCE = datetime.timedelta(minutes=10)
+
+# 斷線重連節流：斷線後先等待寬限期（讓 API 自身的自動重連先嘗試），每次自動登入之間至少間隔冷卻時間
+RECONNECT_GRACE_SEC = 20.0
+RECONNECT_COOLDOWN_SEC = 60.0
 
 
 def _now_tw() -> datetime.datetime:
@@ -25,6 +41,70 @@ def _now_tw() -> datetime.datetime:
 def _from_ts_tw(ts_val: int | float) -> datetime.datetime:
     """將 Unix Timestamp 強制轉換為台灣時間 (UTC+8, 無 tzinfo)"""
     return datetime.datetime.fromtimestamp(int(ts_val), tz=TZ_TW).replace(tzinfo=None, second=0, microsecond=0)
+
+
+class _SymbolSwitched(Exception):
+    """同步途中商品已被切換：中止本次同步，不可把舊商品資料寫進新商品"""
+
+
+def _valid_price(val: Any) -> Optional[float]:
+    """轉為正的有限浮點數；缺值、非數字、<= 0 或 NaN/Inf 一律回傳 None"""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")) or f <= 0:
+        return None
+    return f
+
+
+def find_outlier_kbar_keys(kbars: Dict[datetime.datetime, Dict[str, Any]]) -> List[datetime.datetime]:
+    """
+    找出應剔除的異常 K 棒時間（依時間排序回傳）：
+    - 缺 low / close（或非正數）的 K 棒視為無效。
+    - 任一 OHLC 價格與鄰近 K 棒（前後各 OUTLIER_NEIGHBOR_WINDOW 根）收盤價中位數相比，
+      偏離超過 OUTLIER_MAX_DEVIATION_RATIO 者視為異常值。
+    為避免誤殺，鄰近 K 棒數為偶數時需同時偏離上、下中位數才剔除（兩種價位各佔一半時不判定）。
+    """
+    bad: List[datetime.datetime] = []
+    valid: List[tuple] = []  # (dt, close, [該棒所有有效價格])
+    for dt in sorted(kbars.keys()):
+        b = kbars[dt]
+        low = _valid_price(b.get("low"))
+        close = _valid_price(b.get("close"))
+        if low is None or close is None:
+            bad.append(dt)
+            continue
+        prices = [low, close]
+        for fld in ("open", "high"):
+            pv = _valid_price(b.get(fld))
+            if pv is not None:
+                prices.append(pv)
+        valid.append((dt, close, prices))
+
+    if len(valid) > OUTLIER_MIN_NEIGHBORS:
+        # 快速路徑：全體價格範圍都在容許比例內時，不可能有任何一根偏離鄰近中位數
+        g_min = min(min(v[2]) for v in valid)
+        g_max = max(max(v[2]) for v in valid)
+        if g_max > g_min * (1.0 + OUTLIER_MAX_DEVIATION_RATIO):
+            closes = [v[1] for v in valid]
+            total = len(valid)
+            for i, (dt, _c, prices) in enumerate(valid):
+                lo_i = max(0, i - OUTLIER_NEIGHBOR_WINDOW)
+                hi_i = min(total, i + OUTLIER_NEIGHBOR_WINDOW + 1)
+                neigh = sorted(closes[lo_i:i] + closes[i + 1:hi_i])
+                if len(neigh) < OUTLIER_MIN_NEIGHBORS:
+                    continue
+                med_lo = neigh[(len(neigh) - 1) // 2]
+                med_hi = neigh[len(neigh) // 2]
+                for pv in prices:
+                    if (
+                        abs(pv / med_lo - 1.0) > OUTLIER_MAX_DEVIATION_RATIO
+                        and abs(pv / med_hi - 1.0) > OUTLIER_MAX_DEVIATION_RATIO
+                    ):
+                        bad.append(dt)
+                        break
+    return sorted(bad)
 
 
 class TaishinQuoteFeed:
@@ -56,6 +136,12 @@ class TaishinQuoteFeed:
         self.current_password = ""
         self._conn_lock = threading.Lock()
         self._connect_in_progress = False
+        self._connect_pending = 0          # 尚未結束的連線執行緒數（TechAnalysis + Sol_D）
+        self._needs_reconnect = False      # 曾連線成功後被斷線，需重新登入
+        self._reconnect_not_before = 0.0   # 自動（重）連線最早可執行的時間 (time.time())
+        self._symbol_gen = 0               # 商品世代編號：每次切換商品遞增，供進行中的同步比對
+        self._stale_symbols: set = set()   # 已切換離開的舊商品代碼（其遲到的 K 棒回呼一律丟棄）
+        self._bad_tick_time_count = 0
 
         self.store: Optional[KBarStore] = KBarStore(store_dir) if store_dir else None
         self.raw_ticks: List[TickData] = []
@@ -119,54 +205,115 @@ class TaishinQuoteFeed:
         """註冊 Tick 到達時的回呼函式"""
         self.on_tick_callbacks.append(callback)
 
-    def _parse_match_time(self, time_val: Any) -> datetime.datetime:
-        """解析時間格式 (支援 HH:MM:SS 或 HHMMSS 或整數)，統一採用台灣時間 (UTC+8)"""
-        now = _now_tw()
-        t_str = str(time_val).strip()
+    def _parse_match_time(
+        self, time_val: Any, now: Optional[datetime.datetime] = None
+    ) -> Optional[datetime.datetime]:
+        """
+        解析時間格式 (支援 HH:MM:SS 或 HHMMSS 或整數)，統一採用台灣時間 (UTC+8)
+        - 解析失敗回傳 None（不可把無法解析的時間當成現在時間）。
+        - 來源只有時分秒沒有日期：若比現在晚超過時鐘容許誤差，代表是跨午夜前（或前一交易日）的成交，視為前一日；
+          反之若比現在早將近一整天（本機時鐘略慢、剛跨午夜），視為隔日。
+        - 週日全天與週六 05:00 之後沒有任何盤，日期再往前推到最近的交易時段。
+        """
+        if now is None:
+            now = _now_tw()
+        t_str = str(time_val).strip() if time_val is not None else ""
         try:
             if ":" in t_str:
                 parts = t_str.split(":")
                 hh = int(parts[0])
                 mm = int(parts[1])
                 ss = int(float(parts[2])) if len(parts) > 2 else 0
-                return now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             else:
-                clean = t_str.split(".")[0].zfill(6)
+                digits = t_str.split(".")[0]
+                if not digits.isdigit():
+                    return None
+                clean = digits.zfill(6)
                 hh = int(clean[0:2])
                 mm = int(clean[2:4])
                 ss = int(clean[4:6])
-                return now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-        except Exception:
-            return now
+            dt = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        except (ValueError, IndexError):
+            return None
+
+        if dt - now > TICK_CLOCK_SKEW_TOLERANCE:
+            dt -= datetime.timedelta(days=1)
+        elif now - dt > datetime.timedelta(days=1) - TICK_CLOCK_SKEW_TOLERANCE:
+            dt += datetime.timedelta(days=1)
+        while dt.weekday() == 6 or (dt.weekday() == 5 and dt.time() > datetime.time(5, 0)):
+            dt -= datetime.timedelta(days=1)
+        return dt
+
+    def _note_bad_tick_time(self, source: str, raw: Any):
+        """記錄無法解析的 Tick 時間（前 5 次與之後每 1000 次記一筆，避免洗版）"""
+        self._bad_tick_time_count += 1
+        if self._bad_tick_time_count <= 5 or self._bad_tick_time_count % 1000 == 0:
+            logger.warning(
+                "TaishinQuoteFeed: %s 的成交時間 %r 無法解析，已略過該筆 (累計 %d 筆)",
+                source, raw, self._bad_tick_time_count,
+            )
 
     @staticmethod
-    def _parse_kbar_datetime(date_str: str, time_sn_dply: int) -> Optional[datetime.datetime]:
-        """解析台新 TechAnalysis TKBarRec 的日期與時間 (YYYYMMDD + HHMM)"""
-        if time_sn_dply <= 0:
+    def _night_session_start_date(now: datetime.datetime) -> datetime.date:
+        """回傳目前（或最近一次）夜盤的開始日曆日：15:00 前屬前一日開始的夜盤；週末沒有夜盤開盤，退回週五。"""
+        start = now.date() if now.hour >= 15 else (now.date() - datetime.timedelta(days=1))
+        if start.weekday() == 5:
+            start -= datetime.timedelta(days=1)
+        elif start.weekday() == 6:
+            start -= datetime.timedelta(days=2)
+        return start
+
+    def _save_store_safely(self, symbol: str, kbars: Dict[datetime.datetime, Dict[str, Any]], **kwargs):
+        """存檔失敗只記錄錯誤、不中斷行情流程（KBarStore 已保證失敗時舊檔不受影響）"""
+        if not self.store:
+            return
+        try:
+            self.store.save_kbars(symbol, kbars, **kwargs)
+        except Exception as ex:
+            logger.error("TaishinQuoteFeed: %s K 棒存檔失敗（舊檔保留）: %s", symbol, ex)
+
+    @staticmethod
+    def _parse_kbar_datetime(date_str: str, time_sn_dply: Optional[int]) -> Optional[datetime.datetime]:
+        """
+        解析台新 TechAnalysis TKBarRec 的日期與時間 (YYYYMMDD 交易日 + HHMM)，回傳真實日曆時間：
+        - 時間缺值 (None) 才視為無效；0 代表 00:00 的 K 棒，必須保留。
+        - 15:00 之後的夜盤屬於「下一個交易日」，真實日曆日為前一個交易日（週一交易日 -> 上週五）。
+        - 夜盤跨午夜後的凌晨段 (00:00 ~ 05:00) 真實日曆日為夜盤開始日的隔天：
+          一般即交易日當天，但週一交易日的凌晨段是週六（與 cnyes / 期交所 MIS 路徑的真實日曆日一致）。
+        僅依週末推算，不含國定假日行事曆。
+        """
+        if time_sn_dply is None or time_sn_dply < 0:
             return None
         try:
             dt = datetime.datetime.strptime(str(date_str).strip(), "%Y%m%d")
+            weekday = dt.weekday()
             if time_sn_dply >= 1500:
-                weekday = dt.weekday()
                 if weekday == 0:
                     cal_dt = dt - datetime.timedelta(days=3)
                 elif weekday == 6:
                     cal_dt = dt - datetime.timedelta(days=2)
                 else:
                     cal_dt = dt - datetime.timedelta(days=1)
+            elif time_sn_dply <= 500 and weekday == 0:
+                cal_dt = dt - datetime.timedelta(days=2)
             else:
                 cal_dt = dt
             hh = time_sn_dply // 100
             mm = time_sn_dply % 100
             return cal_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        except Exception:
+        except (ValueError, TypeError):
             return None
 
     def _upsert_kbar_from_rec(self, kb: Any):
         """將台新 TechAnalysis 的 TKBarRec 寫入 1m K 棒快取"""
         if kb is None:
             return
-        t_val = int(getattr(kb, "TimeSn_Dply", 0) or 0)
+        if self._is_stale_product(kb):
+            return
+        t_raw = getattr(kb, "TimeSn_Dply", None)
+        if t_raw is None or t_raw == "":
+            return
+        t_val = int(t_raw)
         dt = self._parse_kbar_datetime(str(getattr(kb, "Date", "")), t_val)
         if dt is None:
             return
@@ -189,13 +336,65 @@ class TaishinQuoteFeed:
             "volume": vol,
         }
 
+    def _is_stale_product(self, kb: Any) -> bool:
+        """
+        K 棒紀錄 (TKBarRec.Product) 若屬於已切換離開的舊商品則為 True（呼叫端須丟棄）。
+        紀錄沒有商品代碼、或代碼不在已知舊商品清單內（例如 API 回傳實際月份合約代碼）時維持接收。
+        """
+        prod = str(getattr(kb, "Product", "") or "").strip().upper()
+        if not prod:
+            return False
+        return prod != str(self.symbol).strip().upper() and prod in self._stale_symbols
+
+    def _activate_symbol_locked(self, symbol: str):
+        """
+        （呼叫端須已持有 self.lock）將目前商品切換為 symbol，並在同一把鎖內清空舊商品的 K 棒 / Tick 快取、
+        預載新商品本地 Parquet。symbol 變更與清快取不可分開，否則 TA 回呼會把舊資料以新代碼存檔。
+        """
+        old = str(self.symbol or "").strip().upper()
+        new = str(symbol or "").strip().upper()
+        if old and old != new:
+            self._stale_symbols.add(old)
+        self._stale_symbols.discard(new)
+        self._symbol_gen += 1
+        self.symbol = symbol
+        self.ta_rcv_done = False
+        self.raw_ticks.clear()
+        self.kbars_1m.clear()
+        self.latest_tick = None
+        if self.store:
+            loaded_k = self.store.load_kbars_dict(symbol)
+            if loaded_k:
+                self.kbars_1m.update(loaded_k)
+                last_dt = max(self.kbars_1m.keys())
+                last_b = self.kbars_1m[last_dt]
+                self.latest_tick = TickData(
+                    timestamp=last_dt,
+                    price=float(last_b["close"]),
+                    volume=int(last_b["volume"]),
+                )
+
     def _on_ta_sso(self, is_ok: bool, msg: str):
         print(f"TaishinQuoteFeed [TechAnalysis SSO]: {is_ok} - {msg}")
 
     def _on_ta_conn(self, is_ok: bool):
+        was_connected = self.ta_connected
         self.ta_connected = bool(is_ok)
         if is_ok:
             self.connected = True
+            self._needs_reconnect = False
+        elif was_connected:
+            # 曾連線成功後被斷線：標記需重連，並給 API 自身的自動重連一段寬限期，避免搶登入
+            self._needs_reconnect = True
+            self._reconnect_not_before = max(self._reconnect_not_before, time.time() + RECONNECT_GRACE_SEC)
+            logger.warning("TaishinQuoteFeed: TechAnalysis 連線中斷，%.0f 秒後若未恢復將自動重連", RECONNECT_GRACE_SEC)
+
+    def _connect_thread_done(self):
+        """一條連線執行緒結束；TechAnalysis 與 Sol_D 兩條都結束才清除 _connect_in_progress"""
+        with self._conn_lock:
+            self._connect_pending = max(0, self._connect_pending - 1)
+            if self._connect_pending == 0:
+                self._connect_in_progress = False
 
     def _on_ta_update(self, ta_type, result_pre, result_last):
         """收到台新 TechAnalysis 即時 1m K 棒更新"""
@@ -204,6 +403,8 @@ class TaishinQuoteFeed:
         try:
             kb = result_last.KBar
             with self.lock:
+                if self._is_stale_product(kb):
+                    return
                 self._upsert_kbar_from_rec(kb)
                 if self.kbars_1m:
                     self._mark_server_pulled(self.symbol, "台新 TechAnalysis 即時伺服器", max(self.kbars_1m.keys()))
@@ -216,8 +417,15 @@ class TaishinQuoteFeed:
             return
         try:
             with self.lock:
-                for r in results:
-                    kb = getattr(r, "KBar", None)
+                fresh = [
+                    kb for kb in (getattr(r, "KBar", None) for r in results)
+                    if kb is not None and not self._is_stale_product(kb)
+                ]
+                if not fresh:
+                    # 整批都是已切換離開的舊商品回補：全部丟棄，不可寫入新商品的快取與 Parquet
+                    logger.info("TaishinQuoteFeed: 丟棄 %d 筆非目前商品 (%s) 的 TechAnalysis 回補 K 棒", len(results), self.symbol)
+                    return
+                for kb in fresh:
                     self._upsert_kbar_from_rec(kb)
                 if self.kbars_1m:
                     last_dt = max(self.kbars_1m.keys())
@@ -229,7 +437,7 @@ class TaishinQuoteFeed:
                     )
                     self._mark_server_pulled(self.symbol, "台新 TechAnalysis 伺服器", last_dt)
                 if self.store and self.kbars_1m:
-                    self.store.save_kbars(self.symbol, self.kbars_1m)
+                    self._save_store_safely(self.symbol, self.kbars_1m)
                 self.ta_rcv_done = True
                 self.connected = True
                 self.status_msg = f"🟢 已載入完成 ({self.symbol}: 共 {len(self.kbars_1m)} 根 K 棒)"
@@ -260,6 +468,9 @@ class TaishinQuoteFeed:
             vol = int(getattr(data, "MatchQty", 1) or 1)
             t_str = getattr(data, "MatchTime", "")
             tick_dt = self._parse_match_time(t_str)
+            if tick_dt is None:
+                self._note_bad_tick_time("OnMatch", t_str)
+                return
 
             tick = TickData(timestamp=tick_dt, price=price, volume=vol)
             self._append_tick(tick)
@@ -276,16 +487,20 @@ class TaishinQuoteFeed:
             if p_val is None or p_val == "" or p_val == 0:
                 return
             price = float(p_val)
-            vol = int(getattr(tick_obj, "MatchQty", 1) or 1)
             t_str = getattr(tick_obj, "MatchTime", "")
             tick_dt = self._parse_match_time(t_str)
+            if tick_dt is None:
+                self._note_bad_tick_time("OnSnapshot", t_str)
+                return
 
-            tick = TickData(timestamp=tick_dt, price=price, volume=vol)
-            self._append_tick(tick)
+            # 快照只是「最後一筆成交」的狀態，該筆成交量已由 OnMatch 計入（或發生在訂閱之前），
+            # 因此只更新價格、不累加成交量（Tick 量記為 0），避免重複計量
+            tick = TickData(timestamp=tick_dt, price=price, volume=0)
+            self._append_tick(tick, count_volume=False)
         except Exception as ex:
             print(f"TaishinQuoteFeed: OnSnapshot 處理例外: {ex}")
 
-    def _append_tick(self, tick: TickData):
+    def _append_tick(self, tick: TickData, count_volume: bool = True):
         with self.lock:
             # 判別內外盤主動屬性 (1: 外盤買進紅, -1: 內盤賣出綠, 0: 中性)
             if tick.side == 0 and self.latest_tick is not None:
@@ -310,9 +525,14 @@ class TaishinQuoteFeed:
                 b["high"] = max(b["high"], float(tick.price))
                 b["low"] = min(b["low"], float(tick.price))
                 b["close"] = float(tick.price)
-                b["volume"] = int(b["volume"]) + int(tick.volume)
+                if count_volume:
+                    if b.pop("snapshot_seed", False):
+                        # 這根 K 棒原本只由快照建立（量為佔位值 1），以第一筆真實成交量取代
+                        b["volume"] = max(1, int(tick.volume))
+                    else:
+                        b["volume"] = int(b["volume"]) + int(tick.volume)
             else:
-                self.kbars_1m[bar_dt] = {
+                new_bar = {
                     "timestamp": bar_dt,
                     "open": float(tick.price),
                     "high": float(tick.price),
@@ -320,6 +540,9 @@ class TaishinQuoteFeed:
                     "close": float(tick.price),
                     "volume": max(1, int(tick.volume)),
                 }
+                if not count_volume:
+                    new_bar["snapshot_seed"] = True
+                self.kbars_1m[bar_dt] = new_bar
             self._mark_server_pulled(self.symbol, "台新 Sol_D 即時推播伺服器", bar_dt)
 
         for cb in self.on_tick_callbacks:
@@ -481,6 +704,9 @@ class TaishinQuoteFeed:
 
             count = 0
             with self.lock:
+                if str(self.symbol).strip().upper() != symbol.strip().upper():
+                    logger.info("TaishinQuoteFeed: 商品已切換，丟棄 %s 的 Solace K 棒回補", symbol)
+                    return 0
                 for rec in txt.split("|"):
                     rec = rec.strip()
                     if not rec:
@@ -522,7 +748,7 @@ class TaishinQuoteFeed:
                     )
                     self._mark_server_pulled(symbol, "台新 Solace His_RTADV 伺服器", last_dt)
                     if self.store:
-                        self.store.save_kbars(symbol, self.kbars_1m)
+                        self._save_store_safely(symbol, self.kbars_1m)
                     self.ta_rcv_done = True
                     self.status_msg = f"🟢 已載入完成 ({symbol}: 共 {len(self.kbars_1m)} 根 K 棒)"
             return count
@@ -544,11 +770,20 @@ class TaishinQuoteFeed:
         source_name = ""
         headers = {"User-Agent": "Mozilla/5.0"}
         today_date = _now_tw().date()
+        purged_keys: List[datetime.datetime] = []  # 需自歷史 Parquet 明確刪除的 K 棒
+
+        # 記下開始同步時的商品世代；HTTP 請求途中若商品被切換，寫入前即中止
+        gen0 = self._symbol_gen
+
+        def _ensure_same_symbol():
+            if self._symbol_gen != gen0 or str(self.symbol).strip().upper() != symbol:
+                raise _SymbolSwitched(symbol)
 
         try:
             if is_stock:
                 # 先清除任何因雲端 UTC+0 時區誤存的非台股交易時段 K 棒 (例如 01:05 ~ 02:15)
                 with self.lock:
+                    _ensure_same_symbol()
                     bad_keys = [
                         dt for dt in self.kbars_1m.keys()
                         if not ((9, 0) <= (dt.hour, dt.minute) <= (13, 35))
@@ -559,6 +794,7 @@ class TaishinQuoteFeed:
                 # Step A: 若本地無資料或最後一根 K 棒非今日，先回補近 5 日歷史 1m K 棒
                 need_5d = True
                 with self.lock:
+                    _ensure_same_symbol()
                     if self.kbars_1m:
                         last_dt = max(self.kbars_1m.keys())
                         if (today_date - last_dt.date()).days <= 1 and len(self.kbars_1m) >= 200:
@@ -576,6 +812,7 @@ class TaishinQuoteFeed:
                                 ts_arr = res_list[0]["timestamp"]
                                 q_obj = res_list[0]["indicators"]["quote"][0]
                                 with self.lock:
+                                    _ensure_same_symbol()
                                     for idx, ts_val in enumerate(ts_arr):
                                         c_v = q_obj["close"][idx]
                                         if c_v is None or float(c_v) <= 0:
@@ -600,8 +837,10 @@ class TaishinQuoteFeed:
                                             pulled_live += 1
                                 source_name = "台股跨日歷史與即時分K伺服器"
                                 break
-                        except Exception:
-                            pass
+                        except _SymbolSwitched:
+                            raise
+                        except Exception as ex:
+                            logger.warning("TaishinQuoteFeed: %s%s 歷史分 K 回補失敗: %s", symbol, sfx, ex)
 
                 # Step B: 透過 0 秒延遲即時分 K 通道補齊今日最新 1m K 棒與即時報價 (強制轉台灣時間 UTC+8，含雙次自動重試)
                 t_list, o_list, h_list, l_list, c_list, v_list = [], [], [], [], [], []
@@ -624,7 +863,8 @@ class TaishinQuoteFeed:
                         live_p = float(q_info.get("6") or 0.0)
                         if t_list or live_p > 0:
                             break
-                    except Exception:
+                    except Exception as ex:
+                        logger.warning("TaishinQuoteFeed: %s 即時分 K 請求失敗 (第 %d 次): %s", symbol, _attempt + 1, ex)
                         time.sleep(0.2)
 
                 now_tw = _now_tw()
@@ -635,6 +875,8 @@ class TaishinQuoteFeed:
                 )
 
                 with self.lock:
+
+                    _ensure_same_symbol()
                     for i, ts_val in enumerate(t_list):
                         c_v = float(c_list[i] or 0.0)
                         if c_v <= 0:
@@ -672,6 +914,7 @@ class TaishinQuoteFeed:
                                         "low": interp_p,
                                         "close": interp_p,
                                         "volume": 1,
+                                        "synthetic": True,
                                     }
 
                     if self.kbars_1m:
@@ -693,6 +936,7 @@ class TaishinQuoteFeed:
                                             "low": prev_c,
                                             "close": prev_c,
                                             "volume": 1,
+                                            "synthetic": True,
                                         }
                             self.kbars_1m[now_bar_dt] = {
                                 "timestamp": now_bar_dt,
@@ -701,6 +945,7 @@ class TaishinQuoteFeed:
                                 "low": min(prev_c, p_final),
                                 "close": p_final,
                                 "volume": max(1, int(last_b["volume"])),
+                                "synthetic": True,
                             }
                             pulled_live += 1
                         else:
@@ -720,6 +965,9 @@ class TaishinQuoteFeed:
                 now_tw_fut = _now_tw()
                 is_night_fut = (now_tw_fut.hour >= 15) or (now_tw_fut.hour < 5) or (now_tw_fut.hour == 5 and now_tw_fut.minute == 0)
                 cnyes_fut = "TWF:TXF:FUTURES"
+                # cnyes 只提供大台 (TXF) 連續分 K：大台可用它刷新；微台 / 小台只能補缺少的分鐘，
+                # 絕不可用 TXF 的成交量覆蓋既有真實 K 棒
+                is_txf_source = not any(k in symbol for k in ("TMF", "MTX", "MXF"))
                 try:
                     r_fut = requests.get(
                         f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=1&symbol={cnyes_fut}&quote=1",
@@ -727,33 +975,29 @@ class TaishinQuoteFeed:
                         timeout=4,
                     )
                     d_fut = (r_fut.json().get("data") or {})
-                    t_list = d_fut.get("t") or []
-                    o_list = d_fut.get("o") or []
-                    h_list = d_fut.get("h") or []
-                    l_list = d_fut.get("l") or []
-                    c_list = d_fut.get("c") or []
-                    v_list = d_fut.get("v") or []
-                    if t_list:
-                        min_srv_dt = _from_ts_tw(min(int(x) for x in t_list))
+                    new_bars = self._build_bars_from_ohlcv_lists(
+                        d_fut.get("t") or [], d_fut.get("o") or [], d_fut.get("h") or [],
+                        d_fut.get("l") or [], d_fut.get("c") or [], d_fut.get("v") or [],
+                    )
+                    if new_bars:
                         with self.lock:
-                            stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt]
-                            for sk in stale_keys:
-                                self.kbars_1m.pop(sk, None)
-                            for i, ts_val in enumerate(t_list):
-                                c_v = float(c_list[i] or 0.0)
-                                if c_v <= 0:
-                                    continue
-                                dt = _from_ts_tw(ts_val)
-                                self.kbars_1m[dt] = {
-                                    "timestamp": dt,
-                                    "open": float(o_list[i] or c_v),
-                                    "high": float(h_list[i] or c_v),
-                                    "low": float(l_list[i] or c_v),
-                                    "close": c_v,
-                                    "volume": max(1, int(float(v_list[i] or 1))),
-                                }
-                                added += 1
-                                pulled_live += 1
+                            _ensure_same_symbol()
+                            if is_txf_source:
+                                # 新資料已驗證成功才取代伺服器涵蓋區間內的舊 K 棒
+                                min_srv_dt = min(new_bars.keys())
+                                stale_keys = [dt for dt in self.kbars_1m.keys() if dt >= min_srv_dt and dt not in new_bars]
+                                for sk in stale_keys:
+                                    self.kbars_1m.pop(sk, None)
+                                purged_keys.extend(stale_keys)
+                                self.kbars_1m.update(new_bars)
+                                added += len(new_bars)
+                                pulled_live += len(new_bars)
+                            else:
+                                for dt, nb in new_bars.items():
+                                    if dt not in self.kbars_1m:
+                                        self.kbars_1m[dt] = nb
+                                        added += 1
+                                        pulled_live += 1
                             if self.kbars_1m:
                                 last_dt_c = max(self.kbars_1m.keys())
                                 last_b_c = self.kbars_1m[last_dt_c]
@@ -763,8 +1007,10 @@ class TaishinQuoteFeed:
                                     volume=int(last_b_c["volume"]),
                                 )
                             source_name = "台指期連續夜日盤分K伺服器"
-                except Exception:
-                    pass
+                except _SymbolSwitched:
+                    raise
+                except Exception as ex:
+                    logger.warning("TaishinQuoteFeed: 期貨連續分 K 同步失敗 (%s): %s", symbol, ex)
 
                 # 再從台灣期貨交易所官網 API (mis.taifex.com.tw) 取得該契約 0 秒延遲精準報價（自動區分日盤 MarketType=0 與夜盤 MarketType=1）
                 cid = "TMF" if "TMF" in symbol else ("MXF" if ("MTX" in symbol or "MXF" in symbol) else "TXF")
@@ -808,18 +1054,17 @@ class TaishinQuoteFeed:
                             c_date = str((rt_data.get("Quote") or {}).get("CDate") or today_date.strftime("%Y%m%d"))
                             ticks_1m = rt_data.get("Ticks") or []
                             with self.lock:
+                                _ensure_same_symbol()
                                 for row in ticks_1m:
                                     if len(row) < 6:
                                         continue
                                     t_hhmm = int(str(row[0]).strip().zfill(6)[:4] or 0)
                                     if target_mkt == "1":
-                                        # 夜盤時段：以當下台灣時間精準推算日曆日，避免跨日錯置
+                                        # 夜盤時段：以夜盤開始日推算真實日曆日，避免跨日錯置
                                         hh_v = t_hhmm // 100
                                         mm_v = t_hhmm % 100
-                                        if now_tw_fut.hour >= 15:
-                                            cal_d = today_date if hh_v >= 15 else (today_date + datetime.timedelta(days=1))
-                                        else:
-                                            cal_d = (today_date - datetime.timedelta(days=1)) if hh_v >= 15 else today_date
+                                        night_start = self._night_session_start_date(now_tw_fut)
+                                        cal_d = night_start if hh_v >= 15 else (night_start + datetime.timedelta(days=1))
                                         dt = datetime.datetime(cal_d.year, cal_d.month, cal_d.day, hh_v, mm_v, 0)
                                     else:
                                         dt = self._parse_kbar_datetime(c_date, t_hhmm)
@@ -839,14 +1084,17 @@ class TaishinQuoteFeed:
                                     added += 1
                                     pulled_live += 1
                                     cnt_1m += 1
-                        except Exception:
-                            pass
+                        except _SymbolSwitched:
+                            raise
+                        except Exception as ex:
+                            logger.warning("TaishinQuoteFeed: 期交所 MIS 1 分 K 拉取失敗 (%s, 盤別 %s): %s", sym_id, target_mkt, ex)
                         return cnt_1m
 
                     # 若目前處於夜盤時段，檢查當日日盤 (08:45~13:45) 是否缺漏（如雲端容器剛重啟），自動補齊日盤 300 根 1m K 棒，確保 20MA/60MA/ATR 連續不跳空！
                     if mkt_type == "1":
                         day_ref_date = today_date if now_tw_fut.hour >= 15 else (today_date - datetime.timedelta(days=1))
                         with self.lock:
+                            _ensure_same_symbol()
                             day_session_cnt = sum(
                                 1 for dt in self.kbars_1m.keys()
                                 if dt.date() == day_ref_date and 8 <= dt.hour <= 13
@@ -859,6 +1107,7 @@ class TaishinQuoteFeed:
 
                     # 同步將期交所最新成交價直接更新至最新一根 1m K 棒
                     with self.lock:
+                        _ensure_same_symbol()
                         if self.kbars_1m:
                             latest_k_dt = max(self.kbars_1m.keys())
                             kb_last = self.kbars_1m[latest_k_dt]
@@ -868,6 +1117,8 @@ class TaishinQuoteFeed:
                             pulled_live += 1
 
                     with self.lock:
+
+                        _ensure_same_symbol()
                         bid_q = float(front_q.get("CBidPrice1") or 0.0)
                         ask_q = float(front_q.get("CAskPrice1") or 0.0)
                         prev_p = self.latest_tick.price if self.latest_tick else last_p
@@ -887,28 +1138,67 @@ class TaishinQuoteFeed:
                         source_name = f"台灣期交所官網 MIS 伺服器 ({sym_id})"
 
             with self.lock:
-                if not is_stock and any(k in symbol for k in ("TMF", "TXF", "MTX", "MXF")):
-                    bad_dts = [
-                        dt for dt, b in self.kbars_1m.items()
-                        if float(b.get("close", 0.0)) < 8000.0 or float(b.get("low", 0.0)) < 8000.0
-                    ]
-                    for b_dt in bad_dts:
-                        self.kbars_1m.pop(b_dt, None)
+
+                _ensure_same_symbol()
+                # 異常值以「與鄰近 K 棒中位數的相對偏離」判斷（期貨與個股皆適用），缺 low/close 視為無效
+                bad_dts = find_outlier_kbar_keys(self.kbars_1m)
+                if bad_dts:
+                    logger.warning("TaishinQuoteFeed: %s 剔除 %d 根異常 K 棒: %s", symbol, len(bad_dts), bad_dts[:5])
+                for b_dt in bad_dts:
+                    self.kbars_1m.pop(b_dt, None)
                 if self.kbars_1m:
                     if pulled_live > 0:
                         last_dt = max(self.kbars_1m.keys())
                         self._mark_server_pulled(symbol, source_name or "即時行情伺服器", last_dt)
                     if self.store:
-                        self.store.save_kbars(symbol, self.kbars_1m, replace_all=True, force_gcs=(pulled_live > 0))
+                        # 合併寫入：記憶體只有部分資料時不可縮短歷史；異常值與被伺服器取代的 K 棒以 delete_keys 明確刪除
+                        self._save_store_safely(
+                            symbol,
+                            self.kbars_1m,
+                            force_gcs=(pulled_live > 0),
+                            delete_keys=set(bad_dts) | set(purged_keys),
+                        )
                     self.ta_rcv_done = True
                     self.connected = True
                     sync_info = self.get_server_sync_info(symbol)
                     self.status_msg = (
                         f"🟢 已從伺服器同步 ({symbol}: {len(self.kbars_1m)} 根 1分K | 最後拉取 {sync_info['pull_time_str'][-8:]})"
                     )
+        except _SymbolSwitched:
+            logger.info("TaishinQuoteFeed: 同步途中商品已切換，丟棄 %s 的同步結果", symbol)
+            return 0
         except Exception as ex:
             print(f"TaishinQuoteFeed: _sync_realtime_kbars_and_quote 例外 ({symbol}): {ex}")
         return added
+
+    @staticmethod
+    def _build_bars_from_ohlcv_lists(t_list, o_list, h_list, l_list, c_list, v_list) -> Dict[datetime.datetime, Dict[str, Any]]:
+        """驗證並轉換 OHLCV 平行陣列；長度不一致或格式錯誤時回傳空字典（呼叫端不得因此刪除既有資料）"""
+        if not t_list:
+            return {}
+        n = len(t_list)
+        if any(len(lst) != n for lst in (o_list, h_list, l_list, c_list, v_list)):
+            logger.warning("TaishinQuoteFeed: 分 K 回應欄位長度不一致，略過本次資料")
+            return {}
+        out: Dict[datetime.datetime, Dict[str, Any]] = {}
+        try:
+            for i, ts_val in enumerate(t_list):
+                c_v = _valid_price(c_list[i])
+                if c_v is None:
+                    continue
+                dt = _from_ts_tw(ts_val)
+                out[dt] = {
+                    "timestamp": dt,
+                    "open": float(o_list[i] or c_v),
+                    "high": float(h_list[i] or c_v),
+                    "low": float(l_list[i] or c_v),
+                    "close": c_v,
+                    "volume": max(1, int(float(v_list[i] or 1))),
+                }
+        except (TypeError, ValueError, OverflowError, OSError) as ex:
+            logger.warning("TaishinQuoteFeed: 分 K 回應格式錯誤，略過本次資料: %s", ex)
+            return {}
+        return out
 
     def ensure_fresh_data(self, symbol: str, user_id: str = "", password: str = ""):
         """
@@ -949,8 +1239,12 @@ class TaishinQuoteFeed:
         if is_stale and (never_pulled or (now_ts - last_sync >= 12.0)):
             self._last_sync_ts[symbol] = now_ts
             self._sync_realtime_kbars_and_quote(symbol)
-        if not self.connected and (user_id or self.current_user_id) and (password or self.current_password):
-            self.start(user_id or self.current_user_id, password or self.current_password, symbol)
+        # 未連線、或曾連線後被斷線 -> 重連；需過寬限 / 冷卻時間且沒有連線進行中，避免重複登入風暴
+        uid = user_id or self.current_user_id
+        pwd = password or self.current_password
+        need_conn = (not self.connected) or self._needs_reconnect
+        if need_conn and uid and pwd and not self._connect_in_progress and time.time() >= self._reconnect_not_before:
+            self.start(uid, pwd, symbol)
 
     def switch_symbol(self, symbol: str, user_id: str = "", password: str = "", lookback_days: int = 15):
         """
@@ -964,25 +1258,10 @@ class TaishinQuoteFeed:
             return
 
         old_symbol = self.symbol
-        self.symbol = symbol
-        self.ta_rcv_done = False
 
-        # Step 1: 切換本地快取
+        # Step 1: 切換本地快取（symbol 變更與清快取在同一把鎖內完成，舊商品遲到的回呼會被丟棄）
         with self.lock:
-            self.raw_ticks.clear()
-            self.kbars_1m.clear()
-            self.latest_tick = None
-            if self.store:
-                loaded_k = self.store.load_kbars_dict(symbol)
-                if loaded_k:
-                    self.kbars_1m.update(loaded_k)
-                    last_dt = max(self.kbars_1m.keys())
-                    last_b = self.kbars_1m[last_dt]
-                    self.latest_tick = TickData(
-                        timestamp=last_dt,
-                        price=float(last_b["close"]),
-                        volume=int(last_b["volume"]),
-                    )
+            self._activate_symbol_locked(symbol)
 
         # Step 2: 若已有連線實例，直接在現有連線通道上退訂舊商品並訂閱新商品
         uid = user_id or self.current_user_id
@@ -995,8 +1274,8 @@ class TaishinQuoteFeed:
                 for cfg in list(self._k_configs):
                     try:
                         self.ta.UnSubTA(cfg)
-                    except Exception:
-                        pass
+                    except Exception as ex:
+                        logger.warning("TaishinQuoteFeed: 退訂舊商品 K 線失敗 (%s): %s", old_symbol, ex)
                 self._k_configs.clear()
 
                 begin_dt = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y%m%d")
@@ -1055,8 +1334,8 @@ class TaishinQuoteFeed:
             try:
                 old_exch = "TWS" if old_symbol.isdigit() else "TWF"
                 self.sol_d.Unsubscribe(old_exch, old_symbol)
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.warning("TaishinQuoteFeed: Sol_D 退訂舊商品失敗 (%s): %s", old_symbol, ex)
             try:
                 new_exch = "TWS" if symbol.isdigit() else "TWF"
                 self.sol_d.Subscribe(new_exch, symbol)
@@ -1082,7 +1361,12 @@ class TaishinQuoteFeed:
             return
 
         # 若已經在連線狀態且帳密相同，僅變更商品時改走熱切換 (不重連 Login)
-        if (self.connected or self.ta_connected) and (self.sol_d or self.ta) and self.current_user_id == user_id:
+        if (
+            (self.connected or self.ta_connected)
+            and (self.sol_d or self.ta)
+            and self.current_user_id == user_id
+            and not self._needs_reconnect
+        ):
             if self.symbol != symbol:
                 self.switch_symbol(symbol, user_id, password, lookback_days=lookback_days)
             else:
@@ -1092,31 +1376,26 @@ class TaishinQuoteFeed:
         with self._conn_lock:
             if self._connect_in_progress:
                 if self.symbol != symbol:
-                    self.symbol = symbol
+                    # 連線中切換商品：同樣要在鎖內清掉舊商品快取，否則舊資料會以新代碼存檔
+                    with self.lock:
+                        self._activate_symbol_locked(symbol)
                 print("TaishinQuoteFeed: 正在連線登入中，已更新目標商品代碼。")
                 return
-            if self.connected and (self.sol_d or self.ta) and self.current_user_id == user_id and self.symbol == symbol:
+            if (
+                self.connected and (self.sol_d or self.ta) and self.current_user_id == user_id
+                and self.symbol == symbol and not self._needs_reconnect
+            ):
                 print("TaishinQuoteFeed: 帳密與商品未變更且已在連線狀態。")
                 return
             self._connect_in_progress = True
+            self._connect_pending = 2  # TechAnalysis 與 Sol_D 兩條連線執行緒
+            self._needs_reconnect = False
+            self._reconnect_not_before = time.time() + RECONNECT_COOLDOWN_SEC
 
         self.stop()
         # 切換商品時，先清空上一個商品的 K 棒與 Tick，並預載新商品的本地 Parquet 快取（若有）
         with self.lock:
-            self.raw_ticks.clear()
-            self.kbars_1m.clear()
-            self.latest_tick = None
-            if self.store:
-                loaded_k = self.store.load_kbars_dict(symbol)
-                if loaded_k:
-                    self.kbars_1m.update(loaded_k)
-                    last_dt = max(self.kbars_1m.keys())
-                    last_b = self.kbars_1m[last_dt]
-                    self.latest_tick = TickData(
-                        timestamp=last_dt,
-                        price=float(last_b["close"]),
-                        volume=int(last_b["volume"]),
-                    )
+            self._activate_symbol_locked(symbol)
 
         self.current_user_id = user_id
         self.current_password = password
@@ -1159,8 +1438,7 @@ class TaishinQuoteFeed:
             except Exception as e:
                 print(f"TaishinQuoteFeed: TechAnalysis 啟動例外: {e}")
             finally:
-                with self._conn_lock:
-                    self._connect_in_progress = False
+                self._connect_thread_done()
 
         def _connect_sol_d():
             # 獨立執行緒 2: 啟動 Sol_D 即時報價與快照訂閱 (不阻塞 K 線回補)
@@ -1207,6 +1485,8 @@ class TaishinQuoteFeed:
                 if not (self.ta_connected or self.kbars_1m):
                     self.status_msg = f"Sol_D 連線異常: {e}"
                 print(f"TaishinQuoteFeed: Sol_D 啟動例外: {e}")
+            finally:
+                self._connect_thread_done()
 
         threading.Thread(target=_connect_ta, daemon=True).start()
         threading.Thread(target=_connect_sol_d, daemon=True).start()
@@ -1221,16 +1501,16 @@ class TaishinQuoteFeed:
             try:
                 for cfg in list(self._k_configs):
                     self.ta.UnSubTA(cfg)
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.warning("TaishinQuoteFeed: stop 退訂 K 線失敗: %s", ex)
         if self.sol_d:
             try:
                 is_stock = self.symbol.isdigit()
                 exch = "TWS" if is_stock else "TWF"
                 self.sol_d.Unsubscribe(exch, self.symbol)
                 self.sol_d.DisConnect()
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.warning("TaishinQuoteFeed: stop 中斷 Sol_D 失敗: %s", ex)
         self.sol_d = None
         self.ta = None
         self._k_configs.clear()
@@ -1279,12 +1559,13 @@ class TaishinQuoteFeed:
             is_stock = self.symbol.isdigit()
 
         if kbars_list:
-            is_idx_fut = not is_stock and any(k in self.symbol.upper() for k in ("TMF", "TXF", "MTX", "MXF"))
+            # 異常值以相對偏離判斷（期貨與個股皆適用），缺 low/close 的 K 棒視為無效
+            bad_keys = set(find_outlier_kbar_keys({b["timestamp"]: b for b in kbars_list}))
             filtered = [
                 b for b in kbars_list
                 if SharedBarBuilder.is_valid_session_time(b["timestamp"], session)
                 and (not is_stock or ((9, 0) <= (b["timestamp"].hour, b["timestamp"].minute) <= (13, 35)))
-                and (not is_idx_fut or (float(b.get("close", 0.0)) >= 8000.0 and float(b.get("low", 0.0)) >= 8000.0))
+                and b["timestamp"] not in bad_keys
             ]
             if not filtered:
                 return self._empty_bars_df()

@@ -81,15 +81,16 @@ def test_credibility_validator_pipeline():
     validator = CredibilityValidator(strategy, contract)
     res = validator.evaluate_all(df, ind_x="fast_ma", x_values=[2, 3], ind_y="slow_ma", y_values=[4, 5], mc_iterations=200)
 
+    # 管線各分項都要能跑完並產出報告
     assert res.is_report.net_profit > 0
     assert res.oos_report.net_profit > 0
-    assert res.oos_passed is True
-    assert res.stress_passed is True
-    assert res.heatmap_plateau_passed is True
-    assert res.monte_carlo_passed is True
     assert res.monte_carlo_report is not None
     assert res.monte_carlo_report.sample_trades_count >= 1
-    assert res.overall_passed is True
+    # 只有 20 根 K 棒、極少交易：樣本不足，絕不可判定為「可信」，且必須說明原因
+    assert res.oos_passed is False
+    assert res.monte_carlo_passed is False
+    assert res.overall_passed is False
+    assert res.reasons
 
 
 def test_monte_carlo_simulation_standalone():

@@ -27,6 +27,11 @@ COPY strategies /app/strategies
 COPY src /app/src
 COPY data /app/data
 
+# 以非 root 使用者執行；data/ 需可寫入（K 線快取與模擬倉狀態）
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
+
 EXPOSE 8080
 
-CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
+# 保留 Streamlit 預設的 XSRF 防護（網站公開部署，不可關閉）
+CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0", "--server.headless=true"]

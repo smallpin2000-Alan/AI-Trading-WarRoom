@@ -18,3 +18,9 @@ env.yaml
 *.gdoc
 *.gsheet
 *.gslides
+
+# 執行期狀態檔（每台機器各自不同，不進版控）
+data/paper_trading_state.json*
+data/ai_predictions_log.json
+data/*.tmp
+data/*.corrupt*

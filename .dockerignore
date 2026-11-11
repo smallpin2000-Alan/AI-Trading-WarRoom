@@ -9,3 +9,16 @@ SolPY.log
 env.yaml
 .env
 config/taishin_config.json
+
+# 執行期狀態檔不可烘進映像檔（雲端以 GCS 為準，否則重新部署會被舊檔覆蓋）
+data/paper_trading_state.json*
+data/ai_predictions_log.json
+data/*.tmp
+data/*.corrupt*
+# 開發用檔案
+tests
+Sample_D.py
+*.md
+*.gdoc
+*.gsheet
+*.gslides

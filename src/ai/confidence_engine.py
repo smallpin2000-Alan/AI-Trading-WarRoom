@@ -83,6 +83,17 @@ class ConfidenceEngine:
     def _sigmoid(x: np.ndarray | float) -> np.ndarray | float:
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))
 
+    @staticmethod
+    def _rolling_bbw_median(bbw: np.ndarray) -> np.ndarray:
+        """布林帶寬的滾動中位數 (回看 30 根 K 棒，只用當根及過去資料)。"""
+        return (
+            pl.Series(bbw)
+            .rolling_median(window_size=30, min_samples=1)
+            .fill_null(strategy="backward")
+            .fill_null(0.8)
+            .to_numpy()
+        )
+
     @classmethod
     def compute_confidence_series(
         cls,
@@ -158,13 +169,7 @@ class ConfidenceEngine:
         short_conf = np.clip(np.round(short_prob, 1), 1.0, 99.0)
 
         # 布林帶寬中位數亦採用滾動窗口 (回看 30 根 K 棒)，嚴格杜絕全局未來資訊偷看
-        s_bbw = pl.Series(bbw)
-        bbw_rolling_med = (
-            s_bbw.rolling_median(window_size=30, min_samples=1)
-            .fill_null(strategy="backward")
-            .fill_null(0.8)
-            .to_numpy()
-        )
+        bbw_rolling_med = cls._rolling_bbw_median(bbw)
 
         eff_thresholds: List[float] = []
         regimes: List[str] = []
@@ -174,7 +179,10 @@ class ConfidenceEngine:
             reg = MarketRegimeDetector.detect_regime_at(float(adx14[i]), float(bbw[i]), cur_med_bbw)
             regimes.append(reg.label_zh)
             if regime_adaptive:
-                eff_th = float(np.clip(base_threshold + reg.threshold_offset, 50.0, 90.0))
+                # 夾限範圍必須包含使用者設定的 base：設定 30 或 95 時不可被硬改寫成 50 / 90
+                lo = min(50.0, float(base_threshold))
+                hi = max(90.0, float(base_threshold))
+                eff_th = float(np.clip(base_threshold + reg.threshold_offset, lo, hi))
             else:
                 eff_th = float(base_threshold)
             eff_thresholds.append(round(eff_th, 1))
@@ -202,7 +210,9 @@ class ConfidenceEngine:
 
         adx_v = float(conf_df["feat_adx_14"][idx])
         bbw_v = float(conf_df["feat_bb_width"][idx])
-        med_bbw = float(conf_df["feat_bb_width"].median() or 0.8)
+        # 與 compute_confidence_series 使用同一個滾動中位數，確保快照的 regime 與序列的
+        # regime_label / effective_threshold 完全一致（不可改用全域中位數）
+        med_bbw = float(cls._rolling_bbw_median(conf_df["feat_bb_width"].to_numpy())[idx])
         reg = MarketRegimeDetector.detect_regime_at(adx_v, bbw_v, med_bbw)
 
         long_c = float(conf_df["long_confidence"][idx])

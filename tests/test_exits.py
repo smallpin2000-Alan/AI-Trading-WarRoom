@@ -27,9 +27,9 @@ def test_atr_multiple_stop_loss_in_engine():
     lows = [o - 15.0 for o in opens]
     closes = [o + 2.0 for o in opens]
 
-    # 第 30 根引發深跌觸發 ATR 停損
-    lows[30] = opens[30] - 80.0
-    closes[30] = opens[30] - 60.0
+    # 第 30 根引發深跌觸發 ATR 停損（ATR(14)=30，2 倍 = 60 點停損距離）
+    lows[30] = opens[30] - 300.0
+    closes[30] = opens[30] - 250.0
 
     df = pl.DataFrame({
         "open": opens,
@@ -60,9 +60,12 @@ def test_atr_multiple_stop_loss_in_engine():
     rep = eng.run_backtest(df)
 
     assert len(rep.trades) > 0
-    # 確保有觸發 ATR 停損離場
-    exit_reasons = [t.exit_reason for t in rep.trades]
-    assert "stop_loss" in exit_reasons or "end_of_data" in exit_reasons
+    # 確保第一筆交易確實在第 30 根被 ATR 停損出場（不接受 end_of_data 充數）
+    first = rep.trades[0]
+    assert first.exit_reason == "stop_loss"
+    assert first.exit_idx == 30
+    # 停損價 = 進場價 - 2 × ATR(30)；開盤高於停損價，成交 = 停損價 - 滑價 1 點
+    assert first.exit_price == first.entry_price - 60.0 - 1.0
 
 
 def test_time_exit_before_settlement():

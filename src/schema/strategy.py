@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 TimeframeType = Literal["1m", "5m", "15m", "30m", "60m", "1D"]
 SessionType = Literal["day_only", "day_and_night"]
@@ -35,6 +35,9 @@ class IndicatorSpec(BaseModel):
 
 
 class BarsSinceExpr(BaseModel):
+    # 條件節點禁止未知欄位：打錯字的運算子不可被靜默忽略
+    model_config = ConfigDict(extra="forbid")
+
     bars_since: ConditionNode
 
 
@@ -42,6 +45,8 @@ OperandType = Union[str, float, int, BarsSinceExpr]
 
 
 class LeafCondition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     cross_above: Optional[tuple[str, Union[str, float]]] = None
     cross_below: Optional[tuple[str, Union[str, float]]] = None
     gt: Optional[tuple[OperandType, OperandType]] = None
@@ -58,6 +63,8 @@ class LeafCondition(BaseModel):
 
 
 class LogicalGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     all: Optional[List[ConditionNode]] = Field(default=None, min_length=1)
     any: Optional[List[ConditionNode]] = Field(default=None, min_length=1)
 
@@ -74,8 +81,12 @@ LogicalGroup.model_rebuild()
 
 
 class StopLossSpec(BaseModel):
+    # 出場規格禁止未知欄位：風控參數打錯字時必須直接拒絕，不可靜默套用預設值
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["fixed_points", "percent", "atr_multiple", "indicator_cross"]
     value: Optional[float] = Field(default=None, gt=0)
+    atr_length: int = Field(default=14, gt=0, le=500, description="atr_multiple 使用的 ATR 期數")
     long: Optional[LeafCondition] = None
     short: Optional[LeafCondition] = None
 
@@ -91,17 +102,24 @@ class StopLossSpec(BaseModel):
 
 
 class TrailingStopSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["points", "percent", "atr_multiple"]
     value: float = Field(gt=0)
     activation_points: float = Field(default=0.0, ge=0)
+    atr_length: int = Field(default=14, gt=0, le=500, description="atr_multiple 使用的 ATR 期數")
 
 
 class TimeExitSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     before_settlement: bool = True
     minutes_before_close: int = Field(default=15, ge=1, le=60)
 
 
 class ExitSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     stop_loss: Optional[StopLossSpec] = None
     take_profit: Optional[StopLossSpec] = None
     trailing_stop: Optional[TrailingStopSpec] = None
@@ -111,6 +129,11 @@ class ExitSpec(BaseModel):
     def enforce_mandatory_stop_loss(self) -> ExitSpec:
         if self.stop_loss is None and self.trailing_stop is None:
             raise ValueError("安全攔截：策略必須至少設定 stop_loss 或 trailing_stop 其中一種停損機制！")
+        # indicator_cross 只在 K 棒收盤才判斷，盤中沒有任何價位保護；必須搭配一道價位型移動停損
+        if self.stop_loss is not None and self.stop_loss.type == "indicator_cross" and self.trailing_stop is None:
+            raise ValueError(
+                "安全攔截：indicator_cross 停損沒有價位保護，必須同時設定 trailing_stop 作為價位型停損！"
+            )
         return self
 
 
@@ -172,6 +195,11 @@ class StrategySchema(BaseModel):
         _check_node(self.entry_long)
         _check_node(self.entry_short)
         if self.exit.stop_loss and self.exit.stop_loss.type == "indicator_cross":
+            # 有哪個方向的進場，就必須有該方向的指標出場條件，避免單邊部位沒有停損
+            if self.entry_long is not None and self.exit.stop_loss.long is None:
+                raise ValueError("安全攔截：策略定義了 entry_long，indicator_cross 停損必須提供 long 出場條件")
+            if self.entry_short is not None and self.exit.stop_loss.short is None:
+                raise ValueError("安全攔截：策略定義了 entry_short，indicator_cross 停損必須提供 short 出場條件")
             _check_node(self.exit.stop_loss.long)
             _check_node(self.exit.stop_loss.short)
 

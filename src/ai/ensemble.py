@@ -2,6 +2,7 @@
 from __future__ import annotations
 import copy
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Any
@@ -14,6 +15,13 @@ from src.core.indicators import IndicatorEngine
 from src.ai.confidence_engine import ConfidenceEngine
 
 EnsembleMethod = Literal["voting", "average", "dynamic_weighted"]
+
+logger = logging.getLogger(__name__)
+
+# 動態權重：回測交易筆數低於此門檻的模型沒有足夠績效證據，權重評分一律降到最低
+ENSEMBLE_MIN_TRADES_FOR_WEIGHT = 5
+# 動態權重評分下限（績效極差或交易數不足的模型）
+ENSEMBLE_MIN_PERF_SCORE = 0.1
 
 
 @dataclass
@@ -89,8 +97,9 @@ class MultiModelEnsemble:
                     raw["session"] = session
                     s = StrategySchema.model_validate(raw)
                     pool.append((f"範本: {s.id}", s))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 不可靜默略過：策略檔壞掉或不符合安全規則時，必須讓使用者知道該模型未被載入
+                    logger.warning("集成模型池略過策略檔 %s：%s", p.name, exc)
 
         # 2. 自動衍生多組不同方法論的子模型 (趨勢均線、EMA動能、通道突破、布林通道、RSI/ADX濾網)
         presets = [
@@ -227,20 +236,26 @@ class MultiModelEnsemble:
 
         for disp_name, strat in pool:
             eng = EventDrivenEngine(strat, contract, initial_capital)
-            rep = eng.run_backtest(df, cost_multiplier=1.0)
+            try:
+                rep = eng.run_backtest(df, cost_multiplier=1.0)
 
-            ind_specs = {k: v.model_dump() for k, v in strat.indicators.items()}
-            df_ind = IndicatorEngine.compute_indicators(df, ind_specs)
+                ind_specs = {k: v.model_dump() for k, v in strat.indicators.items()}
+                df_ind = IndicatorEngine.compute_indicators(df, ind_specs, base_timeframe=strat.timeframe)
+            except ValueError as exc:
+                # 例如多週期指標無法由目前資料聚合：略過該模型並留下紀錄，不讓單一模型拖垮整個集成
+                logger.warning("集成略過子模型 %s（%s）：%s", strat.id, disp_name, exc)
+                continue
             cols = {col: df_ind[col].to_list() for col in df_ind.columns}
 
-            # 檢查最近 3 根 K 棒內該模型的傾向與當根訊號
+            # 目前訊號：當根 K 棒的進場條件成立，或回測到資料結束時仍持有部位 (end_of_data)。
+            # 已經出場（停損 / 停利 / 反手）的交易方向不代表目前看法，不可當成訊號。
             sig = 0
             if last_idx >= 1:
                 if eng._eval_condition(strat.entry_long, cols, last_idx):
                     sig = 1
                 elif eng._eval_condition(strat.entry_short, cols, last_idx):
                     sig = -1
-                elif len(rep.trades) > 0 and rep.trades[-1].exit_idx >= last_idx - 2:
+                elif len(rep.trades) > 0 and rep.trades[-1].exit_reason == "end_of_data":
                     sig = rep.trades[-1].direction
 
             # 子模型個別信心度：融合特徵基礎信心度與該模型近期勝率/訊號方向
@@ -258,7 +273,14 @@ class MultiModelEnsemble:
             is_en = True if enabled_model_ids is None else (strat.id in enabled_model_ids)
             # 績效評分供動態權重使用
             pf_cap = min(rep.profit_factor, 4.0) if rep.profit_factor != float("inf") else 3.0
-            perf_score = max(0.1, (1.0 + rep.net_profit / max(10000.0, initial_capital)) * (0.5 + 0.3 * pf_cap))
+            if rep.total_trades < ENSEMBLE_MIN_TRADES_FOR_WEIGHT:
+                # 交易數不足（含零交易）：沒有績效證據，不可因「沒虧錢」而拿到中等權重
+                perf_score = ENSEMBLE_MIN_PERF_SCORE
+            else:
+                perf_score = max(
+                    ENSEMBLE_MIN_PERF_SCORE,
+                    (1.0 + rep.net_profit / max(10000.0, initial_capital)) * (0.5 + 0.3 * pf_cap),
+                )
             raw_scores.append(perf_score if is_en else 0.0)
 
             sub_models.append(
@@ -303,8 +325,10 @@ class MultiModelEnsemble:
                 models=sub_models,
             )
 
-        bull_votes = sum(1 for m in active_models if m.long_confidence >= eff_th or m.latest_signal == 1)
-        bear_votes = sum(1 for m in active_models if m.short_confidence >= eff_th or m.latest_signal == -1)
+        # 投票只計各子模型「實際的」訊號。各模型的信心度都源自同一份基礎信心度，
+        # 若以信心度達標計票，等於同一個意見被重複計算 N 次，並非獨立投票。
+        bull_votes = sum(1 for m in active_models if m.latest_signal == 1)
+        bear_votes = sum(1 for m in active_models if m.latest_signal == -1)
         neutral_votes = max(0, n_active - bull_votes - bear_votes)
 
         if method == "average":
@@ -329,9 +353,10 @@ class MultiModelEnsemble:
             elif bear_votes > n_active / 2.0 and bear_votes > bull_votes:
                 final_act = -1
         else:
-            if ens_long >= eff_th and ens_long > ens_short:
+            # 除了融合信心度達標，還必須至少有一個子模型在該方向有實際訊號
+            if ens_long >= eff_th and ens_long > ens_short and bull_votes >= 1:
                 final_act = 1
-            elif ens_short >= eff_th and ens_short > ens_long:
+            elif ens_short >= eff_th and ens_short > ens_long and bear_votes >= 1:
                 final_act = -1
 
         return EnsembleDecision(

@@ -8,10 +8,14 @@
 """
 
 import json
+import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict, Optional
 import requests
+
+logger = logging.getLogger(__name__)
 
 CACHE_PATH = Path("config/symbol_names_cache.json")
 
@@ -161,18 +165,26 @@ def _load_disk_cache() -> None:
             data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 _memory_cache.update({str(k).upper(): str(v).strip() for k, v in data.items()})
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.warning("symbol_lookup: 讀取代碼名稱快取 %s 失敗: %s", CACHE_PATH, ex)
 
 
 def _save_disk_cache() -> None:
+    """寫入代碼名稱快取：先寫暫存檔再 os.replace 原子取代，失敗時舊檔保持完整並記錄例外"""
+    tmp_path = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}.tmp")
     try:
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         # 只存額外擴充的非內建代碼
         custom_data = {k: v for k, v in _memory_cache.items() if k not in BUILTIN_SYMBOLS or BUILTIN_SYMBOLS[k] != v}
-        CACHE_PATH.write_text(json.dumps(custom_data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        tmp_path.write_text(json.dumps(custom_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, CACHE_PATH)
+    except Exception as ex:
+        logger.warning("symbol_lookup: 寫入代碼名稱快取 %s 失敗: %s", CACHE_PATH, ex)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError as rm_ex:
+            logger.warning("symbol_lookup: 無法移除暫存檔 %s: %s", tmp_path, rm_ex)
 
 
 def get_symbol_name(symbol_code: str) -> str:
@@ -212,8 +224,8 @@ def get_symbol_name(symbol_code: str) -> str:
                         _memory_cache[clean] = name
                         _save_disk_cache()
                         return name
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.info("symbol_lookup: TWSE 查詢 %s 失敗: %s", clean, ex)
 
         # 若 TWSE 查無結果，嘗試向櫃買中心 (TPEx) 興櫃股票 OpenAPI 查詢 (涵蓋全台 367+ 檔興櫃股票)
         try:
@@ -228,8 +240,8 @@ def get_symbol_name(symbol_code: str) -> str:
                 _save_disk_cache()
                 if clean in _memory_cache:
                     return _memory_cache[clean]
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.info("symbol_lookup: TPEx 興櫃查詢 %s 失敗: %s", clean, ex)
 
     return ""
 
