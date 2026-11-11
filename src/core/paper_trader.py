@@ -40,6 +40,14 @@ RESET_GRACE_SEC = 12.0
 # 持倉中收到反向訊號時，允許反手所需的最低信心度（%）
 REVERSE_MIN_CONFIDENCE = 68.0
 
+# AI 自動操盤預設出場參數（以 ATR 倍數表示，隨市場波動自動調整停損距離）
+# 背景：固定 45 點停損遠小於微台 5 分 K 振幅中位數（約 124 點），幾乎必被正常波動掃出場
+DEFAULT_ATR_LENGTH = 14
+DEFAULT_ATR_STOP_MULT = 1.5        # 停損 = 1.5 倍 ATR
+DEFAULT_ATR_TP_MULT = 2.5          # 停利 = 2.5 倍 ATR（損益比約 1.67）
+DEFAULT_ATR_TRAIL_MULT = 1.0       # 移動停損距離 = 1 倍 ATR
+DEFAULT_ATR_TRAIL_ACTIVATION = 1.5  # 獲利達 1.5 倍 ATR 才啟動移動停損
+
 _TW_TZ = timezone(timedelta(hours=8))
 # 台指期夜盤 15:00 開盤即屬於「下一個交易日」：將台灣時間往後推 9 小時再取日期
 _TRADING_DAY_SHIFT = timedelta(hours=9)
@@ -53,6 +61,51 @@ def trading_day_of(now_tw: datetime) -> str:
 def current_trading_day() -> str:
     """目前所屬的期貨交易日（以台灣時間 UTC+8 計算，不受主機時區影響）。"""
     return trading_day_of(datetime.now(_TW_TZ).replace(tzinfo=None))
+
+
+def default_atr_exit_spec() -> Dict[str, Any]:
+    """AI 自動操盤預設的 ATR 出場設定（dict 形式，供 StrategySchema 驗證）。"""
+    return {
+        "stop_loss": {"type": "atr_multiple", "value": DEFAULT_ATR_STOP_MULT, "atr_length": DEFAULT_ATR_LENGTH},
+        "take_profit": {"type": "atr_multiple", "value": DEFAULT_ATR_TP_MULT, "atr_length": DEFAULT_ATR_LENGTH},
+        "trailing_stop": {
+            "type": "atr_multiple",
+            "value": DEFAULT_ATR_TRAIL_MULT,
+            "activation_atr_multiple": DEFAULT_ATR_TRAIL_ACTIVATION,
+            "atr_length": DEFAULT_ATR_LENGTH,
+        },
+    }
+
+
+def default_ai_strategy(symbol: str = "TMF") -> StrategySchema:
+    """戰情室 AI 自動模擬操盤使用的預設策略（進場由 AI 訊號驅動，出場以 ATR 倍數控管）。"""
+    return StrategySchema.model_validate({
+        "id": "ai_copilot_auto",
+        "version": 2,
+        "symbol": symbol,
+        "timeframe": "5m",
+        "session": "day_and_night",
+        "indicators": {
+            "ma5": {"type": "SMA", "source": "close", "length": 5},
+            "ma20": {"type": "SMA", "source": "close", "length": 20},
+        },
+        "entry_long": {"cross_above": ["ma5", "ma20"]},
+        "entry_short": {"cross_below": ["ma5", "ma20"]},
+        "exit": default_atr_exit_spec(),
+    })
+
+
+def ensure_atr_exits(strategy: StrategySchema) -> tuple[StrategySchema, bool]:
+    """
+    若策略的停損不是 ATR 倍數（例如舊版存檔的固定 45 點），回傳改用預設 ATR 出場設定的新策略。
+    不修改傳入的物件；回傳 (策略, 是否有轉換)。
+    """
+    sl = strategy.exit.stop_loss
+    if sl is not None and sl.type == "atr_multiple":
+        return strategy, False
+    data = strategy.model_dump()
+    data["exit"] = {**data["exit"], **default_atr_exit_spec()}
+    return StrategySchema.model_validate(data), True
 
 
 def _dt_to_str(value: Optional[datetime]) -> Optional[str]:
@@ -112,7 +165,7 @@ class PaperTradingEngine:
     4. 內建單日最大虧損鎖定 (Daily Max Loss Limit) 與一鍵緊急平倉 (Kill Switch)。
     """
 
-    VERSION = 7
+    VERSION = 8  # v8：出場改為 ATR 倍數停損
 
     def __init__(
         self,
@@ -253,6 +306,14 @@ class PaperTradingEngine:
     def daily_realized_pnl(self) -> float:
         """本交易日（或自上次手動重置風控後）的已實現損益。"""
         return round(self.realized_pnl - self._daily_loss_baseline_pnl, 2)
+
+    def _bars_with_exit_atr(self, df_bars: pl.DataFrame) -> Dict[str, List[Any]]:
+        """
+        將 K 棒轉成欄位字典，並補上出場規則需要的 ATR 欄位。
+        AI 即時路徑傳入的是原始 K 棒（沒有 ATR 欄位），若不補算，ATR 型停損會永遠「暖機中」而無法開倉或更新。
+        """
+        df_atr = add_exit_atr_columns(df_bars, self.strategy)
+        return {col: df_atr[col].to_list() for col in df_atr.columns}
 
     @staticmethod
     def _entry_reason(target_dir: int, pos_dir: int) -> str:
@@ -637,7 +698,7 @@ class PaperTradingEngine:
         # 安全最高原則：只要還有未平倉部位，停損 / 停利 / 移動鎖利就必須持續守護，
         # 不因「暫停操盤」、Kill Switch、單日損益或模型退化鎖定而停止檢核（這些狀態只禁止開新倉）。
         has_bars = df_bars is not None and df_bars.height > 0
-        cols = {col: df_bars[col].to_list() for col in df_bars.columns} if has_bars else {}
+        cols = self._bars_with_exit_atr(df_bars) if has_bars else {}
         n_bars = df_bars.height if has_bars else 0
         latest_bar_ts = cols["timestamp"][-1] if "timestamp" in cols and n_bars > 0 else None
 
@@ -775,7 +836,7 @@ class PaperTradingEngine:
         # 讀取 ATR
         atr_entry_val = {}
         if df_bars.height > 0:
-            cols = {col: df_bars[col].to_list() for col in df_bars.columns}
+            cols = self._bars_with_exit_atr(df_bars)
             atr_entry_val = read_atr_values(cols, self.strategy, max(0, df_bars.height - 2))
 
         # 開新倉

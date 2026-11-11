@@ -22,3 +22,6 @@ Sample_D.py
 *.gdoc
 *.gsheet
 *.gslides
+
+# 歷史回測資料不打包進映像檔
+data/history/

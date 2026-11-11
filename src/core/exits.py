@@ -145,6 +145,20 @@ def can_open_position(
     return False, "策略沒有任何停損設定，拒絕進場"
 
 
+def _trailing_activation(ts_spec: Any, entry_atr: Dict[int, float]) -> float:
+    """
+    移動停損的啟動門檻（點數）。
+    有設定 activation_atr_multiple 且進場 ATR 有效時，以「倍數 × 進場 ATR」計算；否則使用 activation_points。
+    """
+    mult = getattr(ts_spec, "activation_atr_multiple", None)
+    if mult:
+        ln = int(getattr(ts_spec, "atr_length", 14) or 14)
+        atr = entry_atr.get(ln, float("nan"))
+        if atr is not None and not math.isnan(atr) and atr > 0:
+            return float(mult) * float(atr)
+    return float(ts_spec.activation_points)
+
+
 def compute_exit_levels(
     strategy: StrategySchema,
     direction: int,
@@ -184,11 +198,12 @@ def compute_exit_levels(
             if init_dist is not None:
                 stop_price = (entry_price - init_dist) if direction == 1 else (entry_price + init_dist)
         if ts_dist is not None:
-            if direction == 1 and (highest_since_entry - entry_price) >= ts_spec.activation_points:
+            activation = _trailing_activation(ts_spec, entry_atr)
+            if direction == 1 and (highest_since_entry - entry_price) >= activation:
                 cand = highest_since_entry - ts_dist
                 if stop_price is None or cand > stop_price:
                     stop_price, stop_reason = cand, "trailing_stop"
-            elif direction == -1 and (entry_price - lowest_since_entry) >= ts_spec.activation_points:
+            elif direction == -1 and (entry_price - lowest_since_entry) >= activation:
                 cand = lowest_since_entry + ts_dist
                 if stop_price is None or cand < stop_price:
                     stop_price, stop_reason = cand, "trailing_stop"

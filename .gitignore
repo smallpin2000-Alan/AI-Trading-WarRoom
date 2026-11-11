@@ -24,3 +24,6 @@ data/paper_trading_state.json*
 data/ai_predictions_log.json
 data/*.tmp
 data/*.corrupt*
+
+# 期交所歷史逐筆資料與合成 K 棒（檔案大、可重新下載，不進版控）
+data/history/

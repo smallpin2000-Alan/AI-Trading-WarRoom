@@ -107,6 +107,8 @@ class TrailingStopSpec(BaseModel):
     type: Literal["points", "percent", "atr_multiple"]
     value: float = Field(gt=0)
     activation_points: float = Field(default=0.0, ge=0)
+    # 以進場時 ATR 的倍數表示啟動門檻；有設定時優先於 activation_points（ATR 不可用時退回 activation_points）
+    activation_atr_multiple: Optional[float] = Field(default=None, gt=0)
     atr_length: int = Field(default=14, gt=0, le=500, description="atr_multiple 使用的 ATR 期數")
 
 

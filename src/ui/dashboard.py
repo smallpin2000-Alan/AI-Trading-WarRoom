@@ -19,8 +19,24 @@ from src.ai.advisor import FuturesAIAdvisor, FuturesAdvice
 from src.ai.cloud_intel import CloudIntelligenceHub, CloudIntelSnapshot
 from src.broker.taishin_quote import TaishinQuoteFeed
 from src.data.symbol_lookup import get_symbol_name, format_symbol_display
-from src.core.paper_trader import PaperTradingEngine, RiskConfig, OpenPosition
-from src.core.engine import ContractSpec
+from dataclasses import replace
+from src.core.paper_trader import (
+    PaperTradingEngine,
+    RiskConfig,
+    OpenPosition,
+    default_ai_strategy,
+    ensure_atr_exits,
+    DEFAULT_ATR_STOP_MULT,
+    DEFAULT_ATR_TP_MULT,
+    DEFAULT_ATR_TRAIL_MULT,
+    DEFAULT_ATR_TRAIL_ACTIVATION,
+    DEFAULT_ATR_LENGTH,
+)
+from src.core.indicators import IndicatorEngine
+from src.core.engine import ContractSpec, EventDrivenEngine
+
+# AI 自動模擬操盤的預設單日最大虧損（元）
+DEFAULT_MAX_DAILY_LOSS = 5000.0
 from src.schema.strategy import StrategySchema
 from src.core.credibility_gate import run_credibility_gate
 from src.ui.admin_gate import (
@@ -81,31 +97,25 @@ def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
         sym_key = symbol.split(" ")[0].upper()
         clean_key = "TMF" if "TMF" in sym_key else "MXF" if "MXF" in sym_key else "TXF" if "TXF" in sym_key else "TMF"
         c_spec = ContractSpec.from_json(clean_key)
-        default_strat = StrategySchema.model_validate({
-            "id": "ai_copilot_auto",
-            "version": 1,
-            "symbol": clean_key,
-            "timeframe": "5m",
-            "session": "day_and_night",
-            "indicators": {
-                "ma5": {"type": "SMA", "source": "close", "length": 5},
-                "ma20": {"type": "SMA", "source": "close", "length": 20},
-            },
-            "entry_long": {"cross_above": ["ma5", "ma20"]},
-            "entry_short": {"cross_below": ["ma5", "ma20"]},
-            "exit": {
-                "stop_loss": {"type": "fixed_points", "value": 45.0},
-                "take_profit": {"type": "fixed_points", "value": 60.0},
-                "trailing_stop": {"type": "points", "value": 15.0, "activation_points": 35.0},
-            },
-        })
+        default_strat = default_ai_strategy(clean_key)
         pt = PaperTradingEngine(
             strategy=default_strat,
             contract=c_spec,
             initial_capital=100_000.0,
-            risk_config=RiskConfig(max_daily_loss=1500.0, max_contracts=1),
+            # 單日虧損上限需容納數次 ATR 停損（1.5 倍 ATR 約 150~200 點 ≈ 1,500~2,000 元/口）
+            risk_config=RiskConfig(max_daily_loss=DEFAULT_MAX_DAILY_LOSS, max_contracts=1),
         )
         pt.load_state_from_disk()
+        # 舊版存檔的固定點數停損（如 45 點）遠小於正常波動，一律轉換為 ATR 倍數停損
+        migrated, changed = ensure_atr_exits(pt.strategy)
+        if changed:
+            pt.strategy = migrated
+            pt.core_engine = EventDrivenEngine(migrated, pt.contract, pt.initial_capital)
+            pt.credibility_verified = False
+            if pt.risk_config.max_daily_loss < DEFAULT_MAX_DAILY_LOSS:
+                pt.risk_config = replace(pt.risk_config, max_daily_loss=DEFAULT_MAX_DAILY_LOSS)
+            pt._log("SYSTEM", "出場設定已由固定點數改為 ATR 倍數停損（可信度檢核需重新執行）")
+            pt.save_state_to_disk()
         holder["instance"] = pt
     st.session_state["paper_trader"] = pt
     return pt
@@ -902,48 +912,79 @@ def main():
         with ctrl_col5:
             st.caption(f"🛡️ 風控：單日虧損上限 -{pt.risk_config.max_daily_loss:,.0f} 元 ｜ 連虧4筆休眠 ｜ 上限 {pt.risk_config.max_contracts} 口")
 
-        with st.expander("⚙️ 點擊自訂個人操盤策略（下單口數／固定停利／防守止損／移動鎖利／單日虧損上限）"):
-            sc1, sc2, sc3, sc4, sc5, sc6 = st.columns([1.0, 1.0, 1.0, 0.9, 1.1, 0.9])
+        with st.expander("⚙️ 點擊自訂個人操盤策略（停損／停利／移動鎖利以 ATR 倍數設定、持倉上限、單日虧損上限）"):
+            ex_cur = pt.strategy.exit
+
+            def _atr_mult(spec, default: float) -> float:
+                return float(spec.value) if spec is not None and spec.type == "atr_multiple" and spec.value else default
+
+            # 目前 ATR(14) 估計值，僅用於把倍數換算成點數提示
+            atr_now = 0.0
+            if feed_tmf_bars.height > DEFAULT_ATR_LENGTH:
+                atr_last = feed_tmf_bars.select(IndicatorEngine.calculate_atr(feed_tmf_bars, DEFAULT_ATR_LENGTH)).to_series()[-1]
+                atr_now = float(atr_last) if atr_last is not None and atr_last == atr_last else 0.0
+            st.caption(
+                f"📏 目前微台 5 分 K ATR({DEFAULT_ATR_LENGTH}) ≈ **{atr_now:,.0f} 點**（停損距離會隨市場波動自動調整）"
+                if atr_now > 0 else "📏 ATR 尚在暖機中（K 棒不足），暫時無法換算點數"
+            )
+            sc1, sc2, sc3, sc4, sc5, sc6, sc7 = st.columns([1.0, 1.0, 1.0, 1.0, 0.8, 1.1, 0.8])
             with sc1:
-                cur_sl = pt.strategy.exit.stop_loss.value if pt.strategy.exit.stop_loss and pt.strategy.exit.stop_loss.value else 45.0
-                safe_sl = min(max(float(cur_sl), 10.0), 300.0)
-                new_sl = st.number_input("防守止損 (點)", min_value=10.0, max_value=300.0, value=safe_sl, step=5.0, help="進場後價格反向虧損達此點數，立即市價停損")
+                new_sl = st.number_input("停損 (ATR 倍數)", min_value=0.5, max_value=5.0, step=0.1,
+                                         value=min(max(_atr_mult(ex_cur.stop_loss, DEFAULT_ATR_STOP_MULT), 0.5), 5.0),
+                                         help="進場後反向虧損達「倍數 × 進場時 ATR」即停損")
+                if atr_now > 0:
+                    st.caption(f"≈ {new_sl * atr_now:,.0f} 點 / {new_sl * atr_now * pt.contract.point_value:,.0f} 元/口")
             with sc2:
-                cur_tp = getattr(pt, "custom_tp_points", 0.0)
-                safe_tp = min(max(float(cur_tp), 0.0), 500.0)
-                new_tp = st.number_input("自動停利 (點, 0=依策略)", min_value=0.0, max_value=500.0, value=safe_tp, step=10.0, help="設定大於 0 時，新倉進場後自動掛出對應固定點數停利")
+                new_tp = st.number_input("停利 (ATR 倍數)", min_value=0.5, max_value=10.0, step=0.1,
+                                         value=min(max(_atr_mult(ex_cur.take_profit, DEFAULT_ATR_TP_MULT), 0.5), 10.0),
+                                         help="獲利達「倍數 × 進場時 ATR」即停利；建議大於停損倍數")
+                if atr_now > 0:
+                    st.caption(f"≈ {new_tp * atr_now:,.0f} 點")
             with sc3:
-                cur_ts = pt.strategy.exit.trailing_stop.value if pt.strategy.exit.trailing_stop else 30.0
-                safe_ts = min(max(float(cur_ts), 10.0), 200.0)
-                new_ts = st.number_input("移動回檔鎖利 (點)", min_value=10.0, max_value=200.0, value=safe_ts, step=5.0, help="獲利自波段最高點回檔超過此點數，自動出場保住利潤")
+                new_ts = st.number_input("移動鎖利距離 (ATR 倍數)", min_value=0.3, max_value=5.0, step=0.1,
+                                         value=min(max(_atr_mult(ex_cur.trailing_stop, DEFAULT_ATR_TRAIL_MULT), 0.3), 5.0),
+                                         help="啟動後，自波段最高（低）點回檔超過「倍數 × ATR」即出場")
             with sc4:
-                cur_max_c = pt.risk_config.max_contracts
-                safe_max_c = min(max(int(cur_max_c), 1), 10)
-                new_max_c = st.number_input("持倉上限 (口)", min_value=1, max_value=10, value=safe_max_c, step=1, help="最大允許持倉口數")
+                cur_act = (ex_cur.trailing_stop.activation_atr_multiple if ex_cur.trailing_stop else None) or DEFAULT_ATR_TRAIL_ACTIVATION
+                new_act = st.number_input("移動鎖利啟動 (ATR 倍數)", min_value=0.3, max_value=10.0, step=0.1,
+                                          value=min(max(float(cur_act), 0.3), 10.0),
+                                          help="獲利達「倍數 × 進場時 ATR」後才開始移動鎖利")
             with sc5:
-                cur_daily_loss = pt.risk_config.max_daily_loss
-                safe_daily_loss = min(max(float(cur_daily_loss), 500.0), 50000.0)
-                new_daily_loss = st.number_input("單日最大虧損上限 (元)", min_value=500.0, max_value=50000.0, value=safe_daily_loss, step=500.0, help="當日累積虧損達到此金額時，強制停止當日所有交易")
+                new_max_c = st.number_input("持倉上限 (口)", min_value=1, max_value=10,
+                                            value=min(max(int(pt.risk_config.max_contracts), 1), 10), step=1)
             with sc6:
+                new_daily_loss = st.number_input("單日最大虧損上限 (元)", min_value=500.0, max_value=50000.0, step=500.0,
+                                                 value=min(max(float(pt.risk_config.max_daily_loss), 500.0), 50000.0),
+                                                 help="當日累積虧損達到此金額時，強制平倉並停止當日交易")
+                if atr_now > 0 and new_daily_loss < new_sl * atr_now * pt.contract.point_value * new_max_c:
+                    st.caption("⚠️ 上限小於一次停損金額，停損前就會先觸發單日鎖定")
+            with sc7:
                 st.write("")
                 st.write("")
                 if st.button("💾 儲存設定", key="btn_save_user_strategy", type="secondary", disabled=not can_write):
-                    from src.schema.strategy import StopLossSpec, TrailingStopSpec
-                    pt.strategy.exit.stop_loss = StopLossSpec(type="fixed_points", value=float(new_sl))
-                    pt.custom_tp_points = float(new_tp)
-                    if new_tp > 0:
-                        pt.strategy.exit.take_profit = StopLossSpec(type="fixed_points", value=float(new_tp))
+                    strat_data = pt.strategy.model_dump()
+                    strat_data["exit"] = {
+                        **strat_data["exit"],
+                        "stop_loss": {"type": "atr_multiple", "value": float(new_sl), "atr_length": DEFAULT_ATR_LENGTH},
+                        "take_profit": {"type": "atr_multiple", "value": float(new_tp), "atr_length": DEFAULT_ATR_LENGTH},
+                        "trailing_stop": {"type": "atr_multiple", "value": float(new_ts),
+                                          "activation_atr_multiple": float(new_act), "atr_length": DEFAULT_ATR_LENGTH},
+                    }
+                    try:
+                        new_strategy = StrategySchema.model_validate(strat_data)
+                    except ValueError as ex:
+                        st.error(f"設定不合法，未儲存：{ex}")
                     else:
-                        pt.strategy.exit.take_profit = None
-                    pt.strategy.exit.trailing_stop = TrailingStopSpec(type="points", value=float(new_ts), activation_points=float(new_ts))
-                    pt.risk_config.max_contracts = int(new_max_c)
-                    pt.risk_config.max_daily_loss = float(new_daily_loss)
-                    # 出場參數已變更：先前的可信度檢核結果不再適用於這組新參數
-                    pt.credibility_verified = False
-                    pt._log("SYSTEM", f"使用者修改策略參數（停損 {new_sl:.0f} / 停利 {new_tp:.0f} / 移動鎖利 {new_ts:.0f} 點），可信度檢核需重新執行")
-                    pt.save_state_to_disk()
-                    st.success("✅ 策略參數與口數上限已即時套用儲存！")
-                    st.rerun()
+                        pt.strategy = new_strategy
+                        pt.core_engine = EventDrivenEngine(new_strategy, pt.contract, pt.initial_capital)
+                        pt.custom_tp_points = 0.0  # 停利改由 ATR 倍數決定，清除舊的固定點數覆寫
+                        pt.risk_config = replace(pt.risk_config, max_contracts=int(new_max_c), max_daily_loss=float(new_daily_loss))
+                        # 出場參數已變更：先前的可信度檢核結果不再適用於這組新參數
+                        pt.credibility_verified = False
+                        pt._log("SYSTEM", f"使用者修改策略參數（停損 {new_sl:.1f} / 停利 {new_tp:.1f} / 移動鎖利 {new_ts:.1f}，啟動 {new_act:.1f} 倍 ATR），可信度檢核需重新執行")
+                        pt.save_state_to_disk()
+                        st.success("✅ 策略參數已套用儲存！")
+                        st.rerun()
 
         with st.expander("📋 展開檢視：AI 模擬操盤交易明細與風控稽核日誌"):
             log_c1, log_c2 = st.columns([1.2, 1.0])
