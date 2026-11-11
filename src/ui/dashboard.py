@@ -39,6 +39,7 @@ from src.core.engine import ContractSpec, EventDrivenEngine
 DEFAULT_MAX_DAILY_LOSS = 5000.0
 from src.schema.strategy import StrategySchema
 from src.core.credibility_gate import run_credibility_gate
+from src.data.taifex_history import DailyHistoryUpdater
 from src.ui.admin_gate import (
     FailedAttemptThrottle,
     get_admin_password,
@@ -329,6 +330,20 @@ def get_global_taishin_feed() -> TaishinQuoteFeed:
 
 
 @st.cache_resource
+def get_history_updater() -> Optional[DailyHistoryUpdater]:
+    """
+    啟動期交所歷史資料每日自動更新（全站只啟動一個背景執行緒）。
+    Cloud Run 檔案系統為暫存且無人瀏覽時不執行，預設不啟用；設定 HISTORY_AUTO_UPDATE=1 可強制啟用。
+    """
+    on_cloud_run = bool(os.getenv("K_SERVICE"))
+    if on_cloud_run and os.getenv("HISTORY_AUTO_UPDATE", "").strip() != "1":
+        return None
+    updater = DailyHistoryUpdater(product="TMF")
+    updater.start()
+    return updater
+
+
+@st.cache_resource
 def get_global_advice_cache() -> dict:
     """跨所有訪客共用的 AI 決策快取 (key -> (timestamp, bar_count, FuturesAdvice))，讓新訪客 0.001 秒直接秒開"""
     return {}
@@ -361,6 +376,9 @@ def main():
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
     st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-11 專業操盤戰情版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
+    history_updater = get_history_updater()
+    if history_updater is not None:
+        st.caption(f"📚 期交所歷史資料自動更新：{history_updater.last_result}")
 
     if is_idle_sleeping:
         st.warning("⏰【智慧防呆休眠中】您已連續看盤超過 30 分鐘。為保護雲端免費額度（確保 0 元），自動刷新已暫停。")

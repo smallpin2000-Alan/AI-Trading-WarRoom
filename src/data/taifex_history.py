@@ -19,10 +19,11 @@ import argparse
 import logging
 import os
 import re
+import threading
 import time
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
@@ -186,13 +187,79 @@ def download_recent(
     return downloaded
 
 
+# 每日自動更新：期交所當日檔案在日盤收盤（13:45）後上架，15:30 後更新可確保取得當天資料
+DAILY_UPDATE_AFTER = dtime(15, 30)
+UPDATE_CHECK_INTERVAL_SEC = 1800
+_TW_TZ = timezone(timedelta(hours=8))
+
+
+def _now_tw() -> datetime:
+    return datetime.now(_TW_TZ).replace(tzinfo=None)
+
+
+def is_update_due(now: datetime, last_run: datetime | None) -> bool:
+    """
+    是否該執行歷史資料更新：
+    - 程式啟動後還沒跑過 → 先跑一次（補齊缺少的日子）
+    - 今天 15:30 之後、且上次執行早於今天 15:30 → 再跑一次（取得當天收盤資料）
+    """
+    if last_run is None:
+        return True
+    today_cutoff = datetime.combine(now.date(), DAILY_UPDATE_AFTER)
+    return now >= today_cutoff and last_run < today_cutoff
+
+
+def update_history(
+    product: str = "TMF",
+    raw_dir: Path = RAW_DIR,
+    out_path: Path | None = None,
+    fetch: Callable[[str], bytes] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Tuple[List[str], int]:
+    """下載缺少的每日檔案；有新檔案或輸出檔不存在時重建歷史 K 棒。回傳 (新下載檔名, K 棒數；未重建為 0)。"""
+    out = Path(out_path) if out_path is not None else history_path(product)
+    new_files = download_recent(raw_dir, fetch=fetch, sleep=sleep)
+    if new_files or not out.exists():
+        return new_files, build_history(raw_dir, product, out)
+    return new_files, 0
+
+
+class DailyHistoryUpdater(threading.Thread):
+    """背景執行緒：定期檢查並更新期交所歷史資料（失敗只記錄，不影響主程式）。"""
+
+    def __init__(self, product: str = "TMF", interval_sec: float = UPDATE_CHECK_INTERVAL_SEC):
+        super().__init__(name=f"taifex-history-{product}", daemon=True)
+        self.product = product
+        self.interval_sec = interval_sec
+        self.last_run: datetime | None = None
+        self.last_result: str = "尚未執行"
+
+    def run_once(self) -> None:
+        now = _now_tw()
+        if not is_update_due(now, self.last_run):
+            return
+        try:
+            new_files, n = update_history(self.product)
+            self.last_result = f"{now:%m/%d %H:%M} 新增 {len(new_files)} 檔" + (f"，重建 {n} 根 K 棒" if n else "")
+            logger.info("期交所歷史資料更新完成：%s", self.last_result)
+            self.last_run = now
+        except Exception as ex:  # 網路或期交所頁面異常：記錄後下次再試，不更新 last_run
+            self.last_result = f"{now:%m/%d %H:%M} 更新失敗：{ex}"
+            logger.exception("期交所歷史資料自動更新失敗")
+
+    def run(self) -> None:
+        while True:
+            self.run_once()
+            time.sleep(self.interval_sec)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="期交所逐筆成交資料 → 歷史 1 分 K")
     parser.add_argument("--product", default="TMF")
     parser.add_argument("--download", action="store_true", help="先從期交所下載尚未取得的每日檔案")
     args = parser.parse_args()
     if args.download:
-        new_files = download_recent(RAW_DIR)
+        new_files, _ = update_history(args.product)
         print(f"新下載 {len(new_files)} 個檔案：{', '.join(new_files) or '（無）'}")
     n = build_history(RAW_DIR, args.product)
     print(f"已輸出 {history_path(args.product)}：{n} 根 1 分 K")

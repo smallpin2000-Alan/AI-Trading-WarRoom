@@ -104,3 +104,41 @@ def test_download_recent_skips_existing_and_rejects_foreign_links(tmp_path):
     calls.clear()
     assert th.download_recent(raw, fetch=fake_fetch, sleep=lambda s: None) == []
     assert not any(u.endswith("11_10.zip") for u in calls), "已存在的檔案不可重複下載"
+
+
+# ---------------------------------------------------------------------------
+# 每日自動更新
+# ---------------------------------------------------------------------------
+def test_is_update_due_rules():
+    from src.data.taifex_history import is_update_due
+
+    d = datetime(2026, 11, 11, 10, 0)
+    assert is_update_due(d, None), "程式剛啟動時先補一次缺少的日子"
+    assert not is_update_due(d, datetime(2026, 11, 11, 9, 0)), "今天收盤前已跑過就不再跑"
+    assert is_update_due(datetime(2026, 11, 11, 15, 31), datetime(2026, 11, 11, 9, 0)), "收盤資料上架後要再跑一次"
+    assert not is_update_due(datetime(2026, 11, 11, 16, 0), datetime(2026, 11, 11, 15, 40)), "今天已取得收盤資料就不再跑"
+    assert is_update_due(datetime(2026, 11, 12, 8, 0), datetime(2026, 11, 11, 15, 40)) is False, "隔天收盤前不必再跑"
+    assert is_update_due(datetime(2026, 11, 12, 15, 30), datetime(2026, 11, 11, 15, 40))
+
+
+def test_update_history_downloads_then_rebuilds(tmp_path):
+    from src.data import taifex_history as th
+
+    good = tmp_path / "src.zip"
+    _write_zip(good, ["20261110,TMF    ,202611     ,090000,40040,2,-,-, "])
+    page = "window.open('https://www.taifex.com.tw/file/taifex/Dailydownload/DailydownloadCSV/Daily_2026_11_10.zip')"
+    fetch = lambda url: page.encode() if url == th.LIST_PAGE_URL else good.read_bytes()  # noqa: E731
+    raw, out = tmp_path / "raw", tmp_path / "TMF_1m.parquet"
+
+    new_files, n = th.update_history("TMF", raw_dir=raw, out_path=out, fetch=fetch, sleep=lambda s: None)
+    assert new_files == ["Daily_2026_11_10.zip"] and n == 1 and out.exists()
+
+    # 沒有新檔案且輸出檔存在：不重建
+    mtime = out.stat().st_mtime_ns
+    new_files, n = th.update_history("TMF", raw_dir=raw, out_path=out, fetch=fetch, sleep=lambda s: None)
+    assert new_files == [] and out.stat().st_mtime_ns == mtime
+
+    # 沒有新檔案但輸出檔不見了：要用既有原始檔重建
+    out.unlink()
+    new_files, n = th.update_history("TMF", raw_dir=raw, out_path=out, fetch=fetch, sleep=lambda s: None)
+    assert new_files == [] and n == 1 and out.exists()
