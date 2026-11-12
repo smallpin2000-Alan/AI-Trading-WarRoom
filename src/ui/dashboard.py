@@ -328,7 +328,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
             st.rerun()
 
 
-APP_VERSION = "v2.9.0"
+APP_VERSION = "v2.9.1"
 _refreshing_advice_keys: set[str] = set()
 
 
