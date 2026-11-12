@@ -327,7 +327,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
             st.rerun()
 
 
-APP_VERSION = "v2.8.5"
+APP_VERSION = "v2.9.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -383,7 +383,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-11 專業操盤戰情版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • Gemini AI 多空決策 • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-12 規則操盤戰情版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • 開盤區間突破規則多空決策（AI 僅供參考） • 純報價零下單風險")
     history_updater = get_history_updater()
     if history_updater is not None:
         st.caption(f"📚 期交所歷史資料自動更新：{history_updater.last_result}")
@@ -697,6 +697,8 @@ def main():
             banner_title = f"{advice.action_label}（AI 分析僅供參考，不影響模擬倉下單）"
             banner_rationale = advice.rationale
 
+        # 🤖 AI 分析收進預設收合的折疊區：僅供參考，不影響模擬倉下單（多空方向由下方規則訊號決定）
+        ai_box = st.expander(f"🤖 AI 盤勢分析（僅供參考，不影響下單）｜目前 AI 看法：{advice.action_label}", expanded=False)
         # AI 決策大橫幅卡片（整合台新 Nova API 量化三要素：【指標】➔【訊號】➔【方法】＋ 近期回測獲利因子）
         # 注意：禁止任何開頭 4 空白縮排，避免被 Streamlit 誤判為 <pre><code> 程式碼區塊
         taishin_tri_block = ""
@@ -715,13 +717,13 @@ def main():
                 '</div>'
             )
 
-        st.markdown(
+        ai_box.markdown(
             f'<div style="background-color: {bg_color}; border: 2px solid {box_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 18px;">'
             '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">'
             f'<span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📌 分析標的：{ts_symbol} &nbsp;|&nbsp; 週期：{chart_tf} &nbsp;|&nbsp; 市場狀態：{advice.regime_label if is_mkt_open else "🌙 已收盤休市"}</span>'
             f'<span style="font-size: 13px; color: #848e9c;">分析引擎：{advice.source if is_mkt_open else "收盤休市模式"} (更新於 {advice.generated_at})</span>'
             '</div>'
-            f'<div style="font-size: 28px; font-weight: 800; color: {box_color}; margin: 8px 0 12px 0;">{banner_title}</div>'
+            f'<div style="font-size: 18px; font-weight: 700; color: {box_color}; margin: 4px 0 8px 0;">{banner_title}</div>'
             f'<div style="font-size: 15.5px; color: #e0e3eb; line-height: 1.65;">💬 <b>{"AI 盤勢解讀與建議理由" if is_mkt_open else "收盤狀態說明"}：</b>{banner_rationale}</div>'
             f'{taishin_tri_block}'
             '</div>',
@@ -729,7 +731,7 @@ def main():
         )
 
         # 5 張關鍵作戰指標卡片
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5 = ai_box.columns(5)
         if is_mkt_open:
             m1.metric("最新成交價", f"{curr_price:,.1f} {unit}", f"單量 {curr_vol} | {curr_time_str}")
             m2.metric("多空勝率評估", f"多 {advice.long_probability:.0f}% / 空 {advice.short_probability:.0f}%", delta=f"{advice.long_probability - advice.short_probability:+.0f}%")
@@ -763,7 +765,7 @@ def main():
 
         top_news_preview = intel_snap.news_headlines[0] if intel_snap.news_headlines else "暫無重大突發新聞"
 
-        st.markdown(f"""
+        ai_box.markdown(f"""
         <div style="background-color: rgba(30, 34, 45, 0.75); border: 1px solid #2b3139; border-radius: 10px; padding: 12px 18px; margin: 12px 0 6px 0; font-size: 13.5px; color: #d1d4dc;">
             <div style="font-weight: 700; color: #f0b90b; margin-bottom: 6px;">
                 🌐 Google 雲端四維度綜合情報雷達（已納入 AI 下一階段趨勢預估）
@@ -835,21 +837,51 @@ def main():
         orb = compute_orb_state(
             tmf_bars_1m if tmf_bars_1m is not None else TaishinQuoteFeed._empty_bars_df(), now=now_tw, params=ORB_PARAMS
         )
-        orb_label = {"BUY_LONG": "🟢 突破上緣：做多", "SELL_SHORT": "🔴 跌破下緣：做空"}.get(orb.action, "⚪ 觀望")
+        # 規則訊號大卡片（模擬倉的多空方向唯一依據）
         if orb.flatten:
-            orb_label = "⏰ 非進場時段（收盤前或夜盤，不開新倉、持倉強制平倉）"
-        range_txt = (
-            f"上緣 {orb.range_high:,.0f} ／ 下緣 {orb.range_low:,.0f}（寬 {orb.range_high - orb.range_low:,.0f} 點）"
-            if orb.range_high is not None else "開盤區間尚未形成"
+            orb_title, orb_color, orb_bg = "⏰ 非進場時段：不開新倉，持倉強制平倉", "#848e9c", "rgba(132, 142, 156, 0.14)"
+        elif orb.action == "BUY_LONG":
+            orb_title, orb_color, orb_bg = "🟢 突破開盤區間上緣：做多", "#089981", "rgba(8, 153, 129, 0.16)"
+        elif orb.action == "SELL_SHORT":
+            orb_title, orb_color, orb_bg = "🔴 跌破開盤區間下緣：做空", "#f23645", "rgba(242, 54, 69, 0.16)"
+        elif not orb.range_ready:
+            orb_title, orb_color, orb_bg = "⏳ 開盤區間形成中：觀望", "#f0b90b", "rgba(240, 185, 11, 0.14)"
+        else:
+            orb_title, orb_color, orb_bg = "⚪ 價格仍在開盤區間內：觀望", "#f0b90b", "rgba(240, 185, 11, 0.14)"
+
+        if orb.range_high is not None and orb.range_low is not None:
+            range_html = (
+                f"<div>📈 <b>區間上緣：</b><span style='font-size:20px;font-weight:700;color:#e0e3eb;'>{orb.range_high:,.0f}</span></div>"
+                f"<div>📉 <b>區間下緣：</b><span style='font-size:20px;font-weight:700;color:#e0e3eb;'>{orb.range_low:,.0f}</span></div>"
+                f"<div>📏 <b>區間寬度：</b>{orb.range_high - orb.range_low:,.0f} 點</div>"
+            )
+            if tmf_curr_p > 0:
+                range_html += (
+                    f"<div>💹 <b>微台現價：</b>{tmf_curr_p:,.0f}"
+                    f"<br/><span style='font-size:12.5px;color:#848e9c;'>距上緣 {orb.range_high - tmf_curr_p:+,.0f} ／ 距下緣 {orb.range_low - tmf_curr_p:+,.0f} 點</span></div>"
+                )
+        else:
+            range_html = f"<div>開盤區間將於 {ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘內形成</div>"
+        breakout_html = (
+            f"<div style='margin-top:8px;font-size:15px;color:#e0e3eb;'>⚡ {orb.reason}：{orb.breakout_ts:%H:%M} 收盤 {orb.breakout_price:,.0f}</div>"
+            if orb.breakout_ts else f"<div style='margin-top:8px;font-size:15px;color:#cfd8dc;'>📝 {orb.reason}</div>"
         )
         st.markdown(
-            f"**📐 規則訊號（開盤區間突破，{ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘）**："
-            f"{orb_label} ｜ {range_txt} ｜ {orb.reason}"
-            + (f" ｜ 突破時間 {orb.breakout_ts:%H:%M} @ {orb.breakout_price:,.0f}" if orb.breakout_ts else "")
-        )
-        st.caption(
-            f"規則：區間完成後第一根收盤突破即進場，一天最多一次、不反手；{ORB_PARAMS.last_entry:%H:%M} 後不開新倉，"
-            f"{ORB_PARAMS.flatten_at:%H:%M} 強制平倉；停損停利沿用 ATR 設定。⚠️ 尚未經足夠歷史資料驗證。"
+            f'<div style="background-color: {orb_bg}; border: 2px solid {orb_color}; border-radius: 12px; padding: 18px 24px; margin: 10px 0 14px 0;">'
+            '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">'
+            f'<span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📐 規則訊號：開盤區間突破（微台 TMF，{ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘區間）｜ 模擬倉依此下單</span>'
+            f'<span style="font-size: 13px; color: #848e9c;">更新於 {now_tw:%H:%M:%S}</span>'
+            '</div>'
+            f'<div style="font-size: 30px; font-weight: 800; color: {orb_color}; margin: 10px 0 12px 0;">{orb_title}</div>'
+            '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; font-size: 14.5px; color: #d1d4dc;">'
+            f'{range_html}'
+            '</div>'
+            f'{breakout_html}'
+            f'<div style="margin-top:10px;padding-top:8px;border-top:1px dashed rgba(255,255,255,0.16);font-size:13px;color:#9aa0a6;">'
+            f'規則：區間完成後第一根 1 分 K 收盤突破即進場，一天最多一次、不反手；{ORB_PARAMS.last_entry:%H:%M} 後不開新倉，'
+            f'{ORB_PARAMS.flatten_at:%H:%M} 強制平倉；停損停利沿用 ATR 設定。⚠️ 尚未經足夠歷史資料驗證。</div>'
+            '</div>',
+            unsafe_allow_html=True,
         )
 
         # 🛡️ 停損停利、收盤強制平倉與規則進場（停損與平倉不受暫停或風控鎖定影響；價格防護由引擎把關）
