@@ -6,7 +6,7 @@ set -e
 # 專案：AI 智慧看盤與多空決策戰情室 (ai-trading-warroom)
 # ==========================================================
 
-PROJECT_ID="point-api-512405"
+PROJECT_ID="gen-lang-client-0810159359"
 REGION="asia-east1"   # 台灣彰化機房，台新與台股連線延遲最低
 SERVICE_NAME="ai-trading-warroom"
 BUCKET_NAME="${PROJECT_ID}-stock-history"

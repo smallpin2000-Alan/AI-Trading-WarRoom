@@ -25,7 +25,7 @@ class KBarStore:
     - 寫入採「暫存檔 + os.replace」原子取代，並以每商品檔案鎖保護 save / load，避免半寫入或交錯覆蓋。
     """
 
-    DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "point-api-512405-stock-history").strip()
+    DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "gen-lang-client-0810159359-stock-history").strip()
     _last_gcs_upload_ts: Dict[str, float] = {}
     # 每個 Parquet 檔一把鎖（跨 KBarStore 實例共用，以檔案絕對路徑為 key）
     _file_locks: Dict[str, threading.RLock] = {}

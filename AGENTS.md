@@ -25,8 +25,8 @@
 - 行情模組為純報價接收（Market Data Feed），絕不發送委託下單指令。
 
 ### 3. 每次修改程式後必須附上雲端網站更新指令
-- 每次修改程式碼並推送至 GitHub (`master` 與 `main`) 後，**回覆使用者時必須貼上包含完整專案 ID (`point-api-512405`) 的 Google Cloud Shell 一鍵更新 Cloud Run 網站指令**：
+- 每次修改程式碼並推送至 GitHub (`master` 與 `main`) 後，**回覆使用者時必須貼上自動偵測真實專案 ID 的 Google Cloud Shell 一鍵更新 Cloud Run 網站指令**（不可寫死 `point-api-512405` 假代號）：
   ```bash
-  cd ~/AI-Trading-WarRoom && git fetch origin master && git reset --hard origin/master && gcloud config set project point-api-512405 && gcloud run deploy ai-trading-warroom --source . --project point-api-512405 --region asia-east1 --allow-unauthenticated
+  cd ~/AI-Trading-WarRoom && git fetch origin master && git reset --hard origin/master && PROJECT_ID=$(gcloud projects list --filter="projectId~gen-lang-client" --format="value(projectId)" --limit=1) && gcloud config set project "$PROJECT_ID" && gcloud run deploy ai-trading-warroom --source . --project "$PROJECT_ID" --region asia-east1 --allow-unauthenticated
   ```
 

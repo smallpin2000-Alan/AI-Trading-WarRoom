@@ -70,7 +70,7 @@ class CloudIntelligenceHub:
     整合：
       1. 全球跨市場指標 (NQ=F, TSM, ^SOX, TWD=X, ^VIX)
       2. Google News 即時新聞標題與多空情緒
-      3. Google Cloud Storage (point-api-512405-stock-history) 法人籌碼與冷卻名單
+      3. Google Cloud Storage (gen-lang-client-0810159359-stock-history) 法人籌碼與冷卻名單
       4. 雲端/本地雙向同步之 AI 歷史預測勝率追蹤器
     """
 
@@ -87,7 +87,7 @@ class CloudIntelligenceHub:
     _shared_news: Dict[str, tuple[float, List[str], str]] = {}                             # key -> (ts, titles, label)
     _refreshing_news_keys: set[str] = set()
 
-    DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "point-api-512405-stock-history").strip()
+    DEFAULT_GCS_BUCKET = os.getenv("GCS_BUCKET", "gen-lang-client-0810159359-stock-history").strip()
     LOCAL_PRED_PATH = Path("data/ai_predictions_log.json")
     LOCAL_INVESTMENT_HISTORY_DIR = Path(r"d:\一般資料\個人資料\Investment\history")
 
