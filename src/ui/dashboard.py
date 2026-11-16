@@ -40,12 +40,12 @@ DEFAULT_MAX_DAILY_LOSS = 5000.0
 from src.schema.strategy import StrategySchema
 from src.core.credibility_gate import run_orb_credibility_gate
 from src.data.taifex_history import DailyHistoryUpdater, history_path
-from src.core.orb_strategy import OrbParams, compute_orb_state
+from src.core.orb_strategy import OrbParams, compute_orb_state, multi_wave_orb_params
 from src.core.key_levels import compute_key_levels, expected_range_hit_rate
 from datetime import datetime, timedelta, timezone, time as dt_time
 
-# 模擬倉使用的開盤區間突破參數（預設 30 分鐘區間）
-ORB_PARAMS = OrbParams()
+# 模擬倉使用的日夜雙盤＋多波段箱型突破參數（有高勝率突破機會即進場）
+ORB_PARAMS = multi_wave_orb_params()
 from src.ui.admin_gate import (
     FailedAttemptThrottle,
     get_admin_password,
@@ -328,7 +328,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
             st.rerun()
 
 
-APP_VERSION = "v2.9.2"
+APP_VERSION = "v2.10.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -852,22 +852,23 @@ def main():
         # 判斷台指期開盤狀態
         tmf_is_open, _ = FuturesAIAdvisor.get_market_session_status("TMF")
 
-        # 📐 開盤區間突破 (ORB) 規則：模擬倉的多空方向完全由規則決定，AI 分析僅供參考
+        # 📐 開盤區間與波段箱型突破規則：日盤＋夜盤全時段監控，有賺錢突破機會即進場
         now_tw = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
         orb = compute_orb_state(
             tmf_bars_1m if tmf_bars_1m is not None else TaishinQuoteFeed._empty_bars_df(), now=now_tw, params=ORB_PARAMS
         )
+        sess_tag = getattr(orb, "session_label", "日盤")
         # 規則訊號大卡片（模擬倉的多空方向唯一依據）
         if orb.flatten:
-            orb_title, orb_color, orb_bg = "⏰ 非進場時段：不開新倉，持倉強制平倉", "#848e9c", "rgba(132, 142, 156, 0.14)"
+            orb_title, orb_color, orb_bg = "⏰ 收盤前 / 盤間休市：不開新倉，持倉強制平倉", "#848e9c", "rgba(132, 142, 156, 0.14)"
         elif orb.action == "BUY_LONG":
-            orb_title, orb_color, orb_bg = "🟢 突破開盤區間上緣：做多", "#089981", "rgba(8, 153, 129, 0.16)"
+            orb_title, orb_color, orb_bg = f"🟢 {sess_tag}突破區間上緣：做多", "#089981", "rgba(8, 153, 129, 0.16)"
         elif orb.action == "SELL_SHORT":
-            orb_title, orb_color, orb_bg = "🔴 跌破開盤區間下緣：做空", "#f23645", "rgba(242, 54, 69, 0.16)"
+            orb_title, orb_color, orb_bg = f"🔴 {sess_tag}跌破區間下緣：做空", "#f23645", "rgba(242, 54, 69, 0.16)"
         elif not orb.range_ready:
-            orb_title, orb_color, orb_bg = "⏳ 開盤區間形成中：觀望", "#f0b90b", "rgba(240, 185, 11, 0.14)"
+            orb_title, orb_color, orb_bg = f"⏳ {sess_tag}開盤區間形成中：觀望", "#f0b90b", "rgba(240, 185, 11, 0.14)"
         else:
-            orb_title, orb_color, orb_bg = "⚪ 價格仍在開盤區間內：觀望", "#f0b90b", "rgba(240, 185, 11, 0.14)"
+            orb_title, orb_color, orb_bg = f"⚪ {sess_tag}價格於區間內整理：等待突破進場", "#f0b90b", "rgba(240, 185, 11, 0.14)"
 
         if orb.range_high is not None and orb.range_low is not None:
             range_html = (
@@ -881,7 +882,7 @@ def main():
                     f"<br/><span style='font-size:12.5px;color:#848e9c;'>距上緣 {orb.range_high - tmf_curr_p:+,.0f} ／ 距下緣 {orb.range_low - tmf_curr_p:+,.0f} 點</span></div>"
                 )
         else:
-            range_html = f"<div>開盤區間將於 {ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘內形成</div>"
+            range_html = f"<div>{sess_tag}開盤區間將於開盤起 {ORB_PARAMS.range_minutes} 分鐘內形成</div>"
         breakout_html = (
             f"<div style='margin-top:8px;font-size:15px;color:#e0e3eb;'>⚡ {orb.reason}：{orb.breakout_ts:%H:%M} 收盤 {orb.breakout_price:,.0f}</div>"
             if orb.breakout_ts else f"<div style='margin-top:8px;font-size:15px;color:#cfd8dc;'>📝 {orb.reason}</div>"
@@ -889,7 +890,7 @@ def main():
         st.markdown(
             f'<div style="background-color: {orb_bg}; border: 2px solid {orb_color}; border-radius: 12px; padding: 18px 24px; margin: 10px 0 14px 0;">'
             '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">'
-            f'<span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📐 規則訊號：開盤區間突破（微台 TMF，{ORB_PARAMS.session_open:%H:%M} 起 {ORB_PARAMS.range_minutes} 分鐘區間）｜ 模擬倉依此下單</span>'
+            f'<span style="font-size: 15px; font-weight: 600; color: #b2b5be;">📐 規則訊號：日夜雙盤開盤區間 ＋ 波段箱型突破（微台 TMF，目前盤別：{sess_tag}）｜ 模擬倉依此下單</span>'
             f'<span style="font-size: 13px; color: #848e9c;">更新於 {now_tw:%H:%M:%S}</span>'
             '</div>'
             f'<div style="font-size: 30px; font-weight: 800; color: {orb_color}; margin: 10px 0 12px 0;">{orb_title}</div>'
@@ -898,8 +899,9 @@ def main():
             '</div>'
             f'{breakout_html}'
             f'<div style="margin-top:10px;padding-top:8px;border-top:1px dashed rgba(255,255,255,0.16);font-size:13px;color:#9aa0a6;">'
-            f'規則：區間完成後第一根 1 分 K 收盤突破即進場，一天最多一次、不反手；{ORB_PARAMS.last_entry:%H:%M} 後不開新倉，'
-            f'{ORB_PARAMS.flatten_at:%H:%M} 強制平倉；停損停利沿用 ATR 設定。⚠️ 尚未經足夠歷史資料驗證。</div>'
+            f'規則：日盤＋夜盤全時段監控，突破開盤區間或近 {ORB_PARAMS.rolling_box_minutes} 分鐘整理箱型（含 0.1 倍 ATR 濾網）即進場，'
+            f'不限一天一次（出場後冷卻 {ORB_PARAMS.reentry_cooldown_minutes} 分鐘即可捕捉下一波機會）；'
+            f'日盤 {ORB_PARAMS.flatten_at:%H:%M}、夜盤 {ORB_PARAMS.night_flatten_at:%H:%M} 收盤前強制平倉；停損停利沿用 ATR 設定。</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -911,7 +913,9 @@ def main():
                 current_price=tmf_curr_p,
                 df_bars=feed_tmf_bars,
                 flatten=orb.flatten,
-                source_note="開盤區間突破",
+                source_note=f"{sess_tag}波段突破",
+                allow_multiple_entries=(ORB_PARAMS.max_entries_per_session > 1),
+                reentry_cooldown_sec=float(ORB_PARAMS.reentry_cooldown_minutes * 60),
             )
             if trade_res and trade_res != "系統暫停或風控鎖定中":
                 st.toast(f"⚡ 微台模擬倉：{trade_res}", icon="📐")

@@ -173,3 +173,29 @@ def test_last_entry_day_persisted(monkeypatch, tmp_path):
     restored.load_state_from_disk(tmp_path / "s.json")
     restored.position = None
     assert restored.sync_with_rule_signal("BUY_LONG", 40030.0, _m5(), flatten=False) is None
+
+
+def test_multi_wave_allows_night_session_and_reentry_after_cooldown(monkeypatch):
+    from src.core.orb_strategy import multi_wave_orb_params
+
+    params = multi_wave_orb_params()
+    night_start = DAY.replace(hour=15, minute=1)
+    # 15:01~15:30 震盪於 40000 ± 20，15:31 起突破上漲至 40080
+    night_bars = _bars(_day_path([40050, 40080]), start=night_start)
+    st_night = compute_orb_state(night_bars, now=DAY.replace(hour=15, minute=35), params=params)
+    assert st_night.session_label == "夜盤"
+    assert not st_night.flatten
+    assert st_night.action == "BUY_LONG"
+
+    eng = _engine(monkeypatch)
+    bars1 = _m5(40)
+    eng.sync_with_rule_signal("BUY_LONG", 40050.0, bars1, flatten=False, allow_multiple_entries=True, reentry_cooldown_sec=60.0)
+    assert eng.position is not None and eng.position.direction == 1
+    eng._close_current_position(40100.0, exit_idx=-1, reason="take_profit")
+    # 冷卻期內不立即重進
+    bars2 = _m5(40).with_columns(pl.col("timestamp") + timedelta(minutes=5))
+    assert eng.sync_with_rule_signal("BUY_LONG", 40120.0, bars2, flatten=False, allow_multiple_entries=True, reentry_cooldown_sec=60.0) is None
+    # 冷卻期過後且 K 棒推進，允許同日再次進場捕捉下一波機會
+    eng._last_exit_ts -= 120.0
+    res2 = eng.sync_with_rule_signal("BUY_LONG", 40120.0, bars2, flatten=False, allow_multiple_entries=True, reentry_cooldown_sec=60.0)
+    assert eng.position is not None and res2 is not None

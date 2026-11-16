@@ -207,6 +207,7 @@ class PaperTradingEngine:
         self._last_stop_out_dir: int = 0
         self._last_stop_out_bar_ts: Optional[datetime] = None
         self._last_entry_bar_ts: Optional[datetime] = None
+        self._last_exit_ts: float = 0.0
         self._last_entry_trading_day: Optional[str] = None  # 規則策略「一天只進場一次」的依據
 
     def _log(
@@ -437,6 +438,7 @@ class PaperTradingEngine:
         self._last_stop_out_dir = 0
         self._last_stop_out_bar_ts = None
         self._last_entry_bar_ts = None
+        self._last_exit_ts = 0.0
         self._last_entry_trading_day = None
         self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
         if save_to_disk:
@@ -583,6 +585,7 @@ class PaperTradingEngine:
         tr.exit_time = now_time_str
         self.closed_trades.append(tr)
         self.position = None
+        self._last_exit_ts = time.time()
         return tr
 
     def check_daily_loss_limit(self, current_price: Optional[float] = None) -> bool:
@@ -857,12 +860,15 @@ class PaperTradingEngine:
         df_bars: pl.DataFrame,
         flatten: bool,
         source_note: str = "開盤區間突破",
+        allow_multiple_entries: bool = False,
+        reentry_cooldown_sec: float = 1200.0,
     ) -> Optional[str]:
         """
-        依「規則訊號」（如開盤區間突破）驅動模擬倉：
+        依「規則訊號」（如開盤區間突破＋波段箱型突破）驅動模擬倉：
         1. 風控檢查與既有持倉的停損 / 停利永遠優先（不受暫停或鎖定影響）。
-        2. flatten=True（收盤前或日盤以外時段）時強制平倉，且不開新倉。
-        3. 一個交易日最多進場一次；持倉中收到反向訊號不反手。
+        2. flatten=True（日盤或夜盤收盤前、或盤間休市時段）時強制平倉，且不開新倉。
+        3. 當 allow_multiple_entries=True 時，取消「一天最多一次」限制：前筆部位出場後經冷卻時間，
+           只要再次出現明確突破訊號即可再次進場捕捉波段機會；當 allow_multiple_entries=False 時維持一天進場一次。
         """
         if current_price <= 0:
             return None
@@ -896,9 +902,26 @@ class PaperTradingEngine:
         target_dir = 1 if action == "BUY_LONG" else -1 if action == "SELL_SHORT" else 0
         if target_dir == 0 or self.position is not None:
             return None  # 觀望；或已有持倉（同向續抱、反向不反手）
+
         today = current_trading_day()
-        if self._last_entry_trading_day == today:
-            return None  # 一天只進場一次
+        latest_bar_ts = (
+            df_bars["timestamp"][-1]
+            if df_bars is not None and df_bars.height > 0 and "timestamp" in df_bars.columns
+            else None
+        )
+        if not allow_multiple_entries:
+            if self._last_entry_trading_day == today:
+                return None  # 單筆模式：一天只進場一次
+        else:
+            # 多波段模式：同根 5 分 K 不重複進場，且平倉/停損後需經過冷卻期才允許下一趟進場
+            if (
+                self._last_entry_bar_ts is not None
+                and latest_bar_ts is not None
+                and latest_bar_ts <= self._last_entry_bar_ts
+            ):
+                return None
+            if self._last_exit_ts > 0 and (time.time() - self._last_exit_ts) < reentry_cooldown_sec:
+                return None
 
         atr_entry_val = (
             read_atr_values(self._bars_with_exit_atr(df_bars), self.strategy, max(0, df_bars.height - 2))
@@ -909,6 +932,7 @@ class PaperTradingEngine:
         if not opened:
             return None
         self._last_entry_trading_day = today
+        self._last_entry_bar_ts = latest_bar_ts
         self.save_state_to_disk()
         dir_zh = "多單" if target_dir == 1 else "空單"
         return f"{source_note}：開立 {dir_zh} {self.position.contracts} 口 @ {self.position.entry_price:,.1f}"
