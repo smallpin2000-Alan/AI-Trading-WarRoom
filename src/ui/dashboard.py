@@ -380,7 +380,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
             st.rerun()
 
 
-APP_VERSION = "v2.11.0"
+APP_VERSION = "v2.12.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -455,7 +455,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-17 保本鎖利＋真突破濾網＋離線補盤版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • 開盤區間突破規則多空決策（AI 僅供參考） • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-17 Excel戰情室雙向看盤＋保本鎖利＋真突破版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • 開盤區間突破規則多空決策（AI 僅供參考） • 純報價零下單風險")
     history_updater = get_history_updater()
     if history_updater is not None:
         st.caption(f"📚 期交所歷史資料自動更新：{history_updater.last_result}")
