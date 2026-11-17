@@ -604,6 +604,91 @@ def execute_excel_commands(ws1, pt: PaperTradingEngine) -> Dict[str, Any]:
     return res
 
 
+def save_snapshot_to_xlsx_file(snapshot: Dict[str, Any], filepath: str | Path = EXCEL_FILENAME) -> bool:
+    """直接使用 openpyxl 寫入實體 xlsx 檔案，即使 Excel 視窗未開也能保持檔案為最新"""
+    try:
+        filepath = Path(filepath)
+        if not filepath.exists():
+            build_excel_template(filepath)
+
+        wb = openpyxl.load_workbook(filepath)
+        ws1 = wb["📊 戰情室即時看盤"]
+
+        m = snapshot["market"]
+        orb = snapshot["orb"]
+        p = snapshot["paper_trader"]
+
+        ws1["B2"].value = snapshot["timestamp"]
+        ws1["D2"].value = snapshot["session_label"]
+        ws1["F2"].value = snapshot["quote_status"]
+        ws1["J2"].value = p["equity"]
+
+        ws1["A9"].value = f"{snapshot['symbol']} (微台)"
+        ws1["B9"].value = m["current_price"]
+        ws1["C9"].value = m["diff"]
+        ws1["D9"].value = f"{m['pct']:+.2f}%"
+        ws1["E9"].value = m["open"]
+        ws1["F9"].value = f"{m['high']:,.1f} / {m['low']:,.1f}"
+        ws1["G9"].value = m["volume_sum"]
+        ws1["H9"].value = m["vwap"]
+        ws1["I9"].value = m["prev_close"]
+        exp_range = f"{m['range_low']:,.0f} ~ {m['range_high']:,.0f}" if m.get("range_low") else "--"
+        ws1["J9"].value = exp_range
+
+        sig_display = f"🚀 {orb['action_desc']}" if orb["action"] != "HOLD" else "⏳ 觀望 / 箱型形成中"
+        ws1["A13"].value = sig_display
+        ws1["B13"].value = orb["range_high"] or "--"
+        ws1["C13"].value = orb["range_low"] or "--"
+        ws1["D13"].value = orb["range_width"] or "--"
+        ws1["J13"].value = orb["reason"] or "--"
+
+        ws1["A17"].value = p["direction"]
+        ws1["B17"].value = p["qty"]
+        ws1["C17"].value = p["entry_price"]
+        ws1["D17"].value = p["pts"]
+        ws1["E17"].value = p["pnl"]
+        ws1["F17"].value = p["stop_loss"]
+        ws1["G17"].value = p["stop_mode"]
+        ws1["H17"].value = p["take_profit"]
+        ws1["I17"].value = p["realized_pnl"]
+
+        # 更新 Sheet 2
+        try:
+            ws2 = wb["📑 歷史成交與日誌"]
+            for r_idx, t in enumerate(snapshot.get("trades", [])[-12:], start=3):
+                ws2.cell(row=r_idx, column=1, value=t.get("trade_id", r_idx - 2))
+                ws2.cell(row=r_idx, column=2, value=t.get("entry_time", ""))
+                ws2.cell(row=r_idx, column=3, value=t.get("exit_time", ""))
+                ws2.cell(row=r_idx, column=4, value=t.get("symbol", "TMF"))
+                ws2.cell(row=r_idx, column=5, value=t.get("side", ""))
+                ws2.cell(row=r_idx, column=6, value=t.get("entry_price", 0))
+                ws2.cell(row=r_idx, column=7, value=t.get("exit_price", 0))
+                ws2.cell(row=r_idx, column=8, value=t.get("profit_loss_pts", 0))
+                ws2.cell(row=r_idx, column=9, value=t.get("profit_loss_twd", 0))
+                ws2.cell(row=r_idx, column=10, value=t.get("exit_reason", ""))
+        except Exception:
+            pass
+
+        # 更新 Sheet 3
+        try:
+            ws3 = wb["📈 最新5分K與指標"]
+            for r_idx, k in enumerate(snapshot.get("recent_5m", [])[-30:], start=3):
+                ws3.cell(row=r_idx, column=1, value=k.get("ts", ""))
+                ws3.cell(row=r_idx, column=2, value=k.get("open", 0))
+                ws3.cell(row=r_idx, column=3, value=k.get("high", 0))
+                ws3.cell(row=r_idx, column=4, value=k.get("low", 0))
+                ws3.cell(row=r_idx, column=5, value=k.get("close", 0))
+                ws3.cell(row=r_idx, column=6, value=k.get("volume", 0))
+        except Exception:
+            pass
+
+        wb.save(filepath)
+        return True
+    except Exception as e:
+        logger.debug("save_snapshot_to_xlsx_file 跳過 (可能檔案被 Excel 鎖定中): %s", e)
+        return False
+
+
 def sync_snapshot_to_excel_app(
     snapshot: Dict[str, Any],
     excel_path: str | Path = EXCEL_FILENAME,
@@ -639,6 +724,13 @@ def sync_snapshot_to_excel_app(
                 break
         if wb is None:
             wb = xl.Workbooks.Open(abs_path)
+
+        # 確保 Excel 視窗正常顯示在前端
+        try:
+            xl.WindowState = -4143  # xlNormal
+            xl.Visible = True
+        except Exception:
+            pass
 
         ws1 = wb.Worksheets("📊 戰情室即時看盤")
 
@@ -777,8 +869,9 @@ def main():
 
     if args.once or (not args.loop and not args.init):
         snap = collect_warroom_snapshot(pt=pt)
+        saved_file = save_snapshot_to_xlsx_file(snap, EXCEL_FILENAME)
         ok = sync_snapshot_to_excel_app(snap, EXCEL_FILENAME, pt=pt)
-        print(f"✅ [{snap['timestamp']}] 單次更新完成 (同步至Excel: {ok}) - 微台現價: {snap['market']['current_price']}, 訊號: {snap['orb']['action']}")
+        print(f"✅ [{snap['timestamp']}] 單次更新完成 (寫入檔案: {saved_file}, 同步至開啟中Excel: {ok}) - 微台現價: {snap['market']['current_price']}, 訊號: {snap['orb']['action']}")
         return
 
     # 迴圈定時同步
@@ -786,8 +879,9 @@ def main():
     while True:
         try:
             snap = collect_warroom_snapshot(pt=pt)
+            save_snapshot_to_xlsx_file(snap, EXCEL_FILENAME)
             ok = sync_snapshot_to_excel_app(snap, EXCEL_FILENAME, pt=pt)
-            print(f"[{snap['timestamp']}] 現價: {snap['market']['current_price']} | 訊號: {snap['orb']['action']} | 部位: {snap['paper_trader']['direction']} (同步: {ok})")
+            print(f"[{snap['timestamp']}] 現價: {snap['market']['current_price']} | 訊號: {snap['orb']['action']} | 部位: {snap['paper_trader']['direction']} (同步開啟中Excel: {ok})")
             time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\n🛑 已由使用者中斷監控。")
