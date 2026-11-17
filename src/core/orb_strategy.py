@@ -79,6 +79,10 @@ class OrbState:
     breakout_price: Optional[float] = None
     reason: str = ""
     session_label: str = "日盤"
+    session_vwap: Optional[float] = None
+    vol_ratio: Optional[float] = None
+    body_ratio: Optional[float] = None
+    quality_note: str = ""
 
 
 def _session_bounds(d: date, p: OrbParams) -> tuple[datetime, datetime, datetime, datetime, datetime]:
@@ -149,6 +153,78 @@ def _active_session_bounds(
     return False, "休市", d, day_open, day_rng_end, day_last_entry, day_flatten, day_close
 
 
+def _calc_quality_metrics(
+    df: pl.DataFrame, eval_idx: int
+) -> tuple[Optional[float], Optional[float], Optional[float], str]:
+    """
+    計算評估當下 (eval_idx) 的 VWAP、量能比 (vol_ratio) 與 K 棒實體飽滿度 (body_ratio)。
+    回傳: (session_vwap, vol_ratio, body_ratio, quality_note)
+    """
+    if df.height == 0 or eval_idx < 0 or eval_idx >= df.height:
+        return None, None, None, ""
+
+    # 1. session_vwap: 截至 eval_idx 的量價加權平均價
+    sub_df = df.slice(0, eval_idx + 1)
+    has_vol = "volume" in sub_df.columns
+    vwap_val: Optional[float] = None
+    if has_vol:
+        tot_vol = float(sub_df["volume"].sum() or 0.0)
+        if tot_vol > 0:
+            vwap_val = float((sub_df["close"] * sub_df["volume"]).sum() / tot_vol)
+        else:
+            vwap_val = float(sub_df["close"].mean() or 0.0)
+    else:
+        vwap_val = float(sub_df["close"].mean() or 0.0)
+
+    # 2. 評估 K 棒 (eval_idx)
+    target_row = df.row(eval_idx, named=True)
+    c = float(target_row["close"])
+    o = float(target_row.get("open", c))
+    h = float(target_row.get("high", c))
+    l = float(target_row.get("low", c))
+    cur_vol = float(target_row.get("volume", 0.0)) if has_vol else 0.0
+
+    # 3. body_ratio: |Close - Open| / max(1.0, High - Low)
+    rng = max(1.0, h - l)
+    body_ratio = round(abs(c - o) / rng, 2)
+
+    # 4. vol_ratio: cur_vol / 前 20 根均量
+    vol_ratio: Optional[float] = None
+    if has_vol and eval_idx > 0:
+        prev_slice = df.slice(max(0, eval_idx - 20), min(eval_idx, 20))
+        prev_vols = [float(v) for v in prev_slice["volume"].to_list() if v is not None]
+        avg_v = sum(prev_vols) / len(prev_vols) if prev_vols else 0.0
+        if avg_v > 0:
+            vol_ratio = round(cur_vol / avg_v, 2)
+        elif cur_vol > 0:
+            vol_ratio = 1.0
+
+    # 5. quality_note 字串
+    note_parts = []
+    if vwap_val is not None:
+        vwap_diff = c - vwap_val
+        if vwap_diff >= 0:
+            note_parts.append(f"✅ 價在VWAP之上 (+{vwap_diff:.0f}點)")
+        else:
+            note_parts.append(f"⚠️ 價在VWAP之下 ({vwap_diff:.0f}點)")
+
+    if vol_ratio is not None:
+        if vol_ratio >= 1.5:
+            note_parts.append(f"🔥 量增 {vol_ratio:.1f}x")
+        else:
+            note_parts.append(f"量能 {vol_ratio:.1f}x")
+
+    if body_ratio is not None:
+        pct = int(body_ratio * 100)
+        if body_ratio >= 0.6:
+            note_parts.append(f"實體飽滿 ({pct}%)")
+        else:
+            note_parts.append(f"實體較弱 ({pct}%)")
+
+    quality_note = "・".join(note_parts)
+    return vwap_val, vol_ratio, body_ratio, quality_note
+
+
 def compute_orb_state(bars_1m: pl.DataFrame, now: datetime, params: OrbParams = OrbParams()) -> OrbState:
     """以「現在時間」之前已完成的 1 分 K 計算當日/當盤 ORB 與波段箱型突破狀態（不使用未來資料）。"""
     p = params
@@ -161,10 +237,19 @@ def compute_orb_state(bars_1m: pl.DataFrame, now: datetime, params: OrbParams = 
         day = _day_bars(bars_1m, d, p, until=now)
         ready, hi, lo, direction, idx = _find_breakout(day, d, p)
 
+        eval_idx = (idx if idx is not None else day.height - 1) if day.height > 0 else -1
+        vwap_val, v_ratio, b_ratio, q_note = _calc_quality_metrics(day, eval_idx)
+
         if not ready:
-            return OrbState(d, False, hi, lo, "WAIT", flatten, reason="開盤區間尚未完成")
+            return OrbState(
+                d, False, hi, lo, "WAIT", flatten, reason="開盤區間尚未完成",
+                session_vwap=vwap_val, vol_ratio=v_ratio, body_ratio=b_ratio, quality_note=q_note
+            )
         if direction == 0:
-            return OrbState(d, True, hi, lo, "WAIT", flatten, reason="價格仍在開盤區間內")
+            return OrbState(
+                d, True, hi, lo, "WAIT", flatten, reason="價格仍在開盤區間內",
+                session_vwap=vwap_val, vol_ratio=v_ratio, body_ratio=b_ratio, quality_note=q_note
+            )
         row = day.row(idx, named=True)
         action: Action = "BUY_LONG" if direction == 1 else "SELL_SHORT"
         if flatten:
@@ -173,6 +258,7 @@ def compute_orb_state(bars_1m: pl.DataFrame, now: datetime, params: OrbParams = 
             d, True, hi, lo, action, flatten,
             breakout_ts=row["timestamp"], breakout_price=float(row["close"]),
             reason=("收盤突破開盤區間上緣" if direction == 1 else "收盤跌破開盤區間下緣"),
+            session_vwap=vwap_val, vol_ratio=v_ratio, body_ratio=b_ratio, quality_note=q_note
         )
 
     in_sess, sess_label, s_date, open_dt, range_end, last_entry_dt, flatten_dt, close_dt = _active_session_bounds(now, p)
@@ -257,10 +343,17 @@ def compute_orb_state(bars_1m: pl.DataFrame, now: datetime, params: OrbParams = 
                 last_hi, last_lo = box_hi, box_lo
                 last_reason = f"前波突破已收斂，目前監控{sess_label}近{lb}分箱型 ({box_lo:,.0f}~{box_hi:,.0f}) 等待下一波突破"
 
+    eval_idx = n - 1 if n > 0 else -1
+    vwap_val, v_ratio, b_ratio, q_note = _calc_quality_metrics(sess_df, eval_idx)
+
     if last_dir == 0:
         disp_hi = box_hi if orb_too_wide else last_hi
         disp_lo = box_lo if orb_too_wide else last_lo
-        return OrbState(s_date, True, disp_hi, disp_lo, "WAIT", flatten, reason=last_reason, session_label=sess_label)
+        return OrbState(
+            s_date, True, disp_hi, disp_lo, "WAIT", flatten,
+            reason=last_reason, session_label=sess_label,
+            session_vwap=vwap_val, vol_ratio=v_ratio, body_ratio=b_ratio, quality_note=q_note
+        )
 
     act: Action = "BUY_LONG" if last_dir == 1 else "SELL_SHORT"
     if flatten or now > last_entry_dt:
@@ -269,6 +362,7 @@ def compute_orb_state(bars_1m: pl.DataFrame, now: datetime, params: OrbParams = 
         s_date, True, last_hi, last_lo, act, flatten,
         breakout_ts=last_brk_ts, breakout_price=last_brk_p,
         reason=last_reason, session_label=sess_label,
+        session_vwap=vwap_val, vol_ratio=v_ratio, body_ratio=b_ratio, quality_note=q_note
     )
 
 

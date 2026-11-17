@@ -73,6 +73,8 @@ def default_atr_exit_spec() -> Dict[str, Any]:
             "value": DEFAULT_ATR_TRAIL_MULT,
             "activation_atr_multiple": DEFAULT_ATR_TRAIL_ACTIVATION,
             "atr_length": DEFAULT_ATR_LENGTH,
+            "breakeven_atr_multiple": 1.0,
+            "breakeven_offset_points": 3.0,
         },
     }
 
@@ -209,6 +211,7 @@ class PaperTradingEngine:
         self._last_entry_bar_ts: Optional[datetime] = None
         self._last_exit_ts: float = 0.0
         self._last_entry_trading_day: Optional[str] = None  # 規則策略「一天只進場一次」的依據
+        self.last_catchup_1m_ts: Optional[datetime] = None  # 離線補盤最後處理的 1 分 K 時間戳
 
     def _log(
         self,
@@ -440,6 +443,7 @@ class PaperTradingEngine:
         self._last_entry_bar_ts = None
         self._last_exit_ts = 0.0
         self._last_entry_trading_day = None
+        self.last_catchup_1m_ts = None
         self._log("SYSTEM", f"🔄 已執行全部模擬重置：虛擬本金恢復為 {self.initial_capital:,.0f} 元，所有持倉、歷史成交與風控紀錄已全數清空。")
         if save_to_disk:
             self.save_state_to_disk()
@@ -937,6 +941,124 @@ class PaperTradingEngine:
         dir_zh = "多單" if target_dir == 1 else "空單"
         return f"{source_note}：開立 {dir_zh} {self.position.contracts} 口 @ {self.position.entry_price:,.1f}"
 
+    def catch_up_missed_bars(
+        self,
+        bars_1m: pl.DataFrame,
+        df_bars_5m: pl.DataFrame,
+        params: Any = None,
+        allow_multiple_entries: bool = False,
+    ) -> List[str]:
+        """
+        關閉網頁離線重開時的「自動補盤回放 (Offline Catch-Up Replay)」：
+        比對 self.last_catchup_1m_ts 與當前 bars_1m。
+        若離線期間錯過停損/停利/收盤平倉，或出現 ORB 突破進場，自動逐根補齊模擬成交紀錄。
+        """
+        if bars_1m is None or bars_1m.height < 2:
+            return []
+
+        ts_series = bars_1m["timestamp"].to_list()
+        latest_ts = ts_series[-1]
+
+        # 首次啟動：記錄當前最新 K 棒時間，不溯及過往歷史
+        if self.last_catchup_1m_ts is None:
+            self.last_catchup_1m_ts = latest_ts
+            self.save_state_to_disk()
+            return []
+
+        # 篩選出離線期間尚未處理的 K 棒
+        missed_df = bars_1m.filter(pl.col("timestamp") > self.last_catchup_1m_ts).sort("timestamp")
+        if missed_df.height <= 1:
+            # 差距 1 根以內交由即時路徑處理
+            self.last_catchup_1m_ts = latest_ts
+            return []
+
+        from src.core.orb_strategy import OrbParams, compute_orb_state
+        orb_p = params if isinstance(params, OrbParams) else OrbParams()
+
+        missed_rows = missed_df.rows(named=True)
+        messages: List[str] = []
+
+        for row in missed_rows:
+            bar_t = row["timestamp"]
+            o = float(row.get("open", row["close"]))
+            h = float(row.get("high", row["close"]))
+            l = float(row.get("low", row["close"]))
+            c = float(row["close"])
+
+            # 1. 若有持倉：檢核停損、保本、停利、或收盤平倉
+            if self.position is not None:
+                dir_m = self.position.direction
+                # 更新最高/最低價
+                self.position.highest_since_entry = max(self.position.highest_since_entry, h)
+                self.position.lowest_since_entry = min(self.position.lowest_since_entry, l)
+
+                sl_p, tp_p, stop_reason = self._compute_stop_and_tp(self.position)
+                self.position.stop_loss_price = sl_p
+                self.position.take_profit_price = tp_p
+
+                # 檢核收盤強制平倉時間
+                state_at_t = compute_orb_state(bars_1m, now=bar_t, params=orb_p)
+                if state_at_t.flatten:
+                    tr = self._close_current_position(c, exit_idx=-1, reason="orb_time_exit")
+                    msg = f"🕒 [離線補盤] 收盤平倉 @ {tr.exit_price:,.1f}，淨損益 {tr.net_pnl:+,.0f} 元"
+                    self._log("ORDER_FILL", msg, price=tr.exit_price, pnl=tr.net_pnl)
+                    messages.append(msg)
+                    continue
+
+                # 檢核停損 / 保本
+                stop_hit = sl_p is not None and (l <= sl_p if dir_m == 1 else h >= sl_p)
+                if stop_hit:
+                    fill_p = sl_p if (dir_m == 1 and o >= sl_p) or (dir_m == -1 and o <= sl_p) else o
+                    tr = self._close_current_position(fill_p, exit_idx=-1, reason=stop_reason)
+                    self._last_stop_out_ts = bar_t.timestamp()
+                    self._last_stop_out_dir = dir_m
+                    self._last_stop_out_bar_ts = bar_t
+                    msg = f"🕒 [離線補盤] 觸發停損 ({stop_reason}) @ {tr.exit_price:,.1f}，淨損益 {tr.net_pnl:+,.0f} 元"
+                    self._log("STOP_OUT", msg, price=tr.exit_price, pnl=tr.net_pnl)
+                    messages.append(msg)
+                    continue
+
+                # 檢核停利
+                tp_hit = tp_p is not None and (h >= tp_p if dir_m == 1 else l <= tp_p)
+                if tp_hit:
+                    fill_p = tp_p if (dir_m == 1 and o <= tp_p) or (dir_m == -1 and o >= tp_p) else o
+                    tr = self._close_current_position(fill_p, exit_idx=-1, reason="take_profit")
+                    msg = f"🕒 [離線補盤] 🎯 停利成交 @ {tr.exit_price:,.1f}，淨損益 {tr.net_pnl:+,.0f} 元"
+                    self._log("ORDER_FILL", msg, price=tr.exit_price, pnl=tr.net_pnl)
+                    messages.append(msg)
+                    continue
+
+            # 2. 若空手且操盤啟動中：檢核是否在離線期間發生突破進場訊號
+            if self.position is None and self.is_active and not self.order_safety_locked:
+                if not (self.kill_switch_locked or self.daily_loss_locked or self.daily_profit_locked or self.degradation_locked):
+                    state_at_t = compute_orb_state(bars_1m, now=bar_t, params=orb_p)
+                    if not state_at_t.flatten and state_at_t.action in ("BUY_LONG", "SELL_SHORT"):
+                        tgt_dir = 1 if state_at_t.action == "BUY_LONG" else -1
+                        t_day = trading_day_of(bar_t)
+                        # 單筆模式檢查當日是否已進場
+                        allow_entry = True
+                        if not allow_multiple_entries and self._last_entry_trading_day == t_day:
+                            allow_entry = False
+
+                        if allow_entry:
+                            atr_val = {}
+                            if df_bars_5m is not None and df_bars_5m.height > 0:
+                                atr_val = read_atr_values(self._bars_with_exit_atr(df_bars_5m), self.strategy, max(0, df_bars_5m.height - 2))
+                            opened = self._open_new_position(
+                                tgt_dir, c, bar_t.strftime("%Y-%m-%d %H:%M"),
+                                reason=f"🕒 [離線補盤] 突破進場 ({state_at_t.reason})", entry_atr=atr_val
+                            )
+                            if opened:
+                                self._last_entry_trading_day = t_day
+                                self._last_entry_bar_ts = bar_t
+                                dir_label = "多單" if tgt_dir == 1 else "空單"
+                                msg = f"🕒 [離線補盤] 成功補進 {dir_label} @ {self.position.entry_price:,.1f}"
+                                messages.append(msg)
+
+        self.last_catchup_1m_ts = latest_ts
+        self.save_state_to_disk()
+        return messages
+
     def save_state_to_disk(self, file_path: Optional[str | Path] = None) -> None:
         """將虛擬操盤帳戶狀態（資金、部位、已平倉交易、風控日誌）持久化儲存至本地磁碟"""
         p = Path(file_path) if file_path is not None else DEFAULT_STATE_PATH
@@ -974,6 +1096,7 @@ class PaperTradingEngine:
             "last_stop_out_bar_ts": _dt_to_str(self._last_stop_out_bar_ts),
             "last_entry_bar_ts": _dt_to_str(self._last_entry_bar_ts),
             "last_entry_trading_day": self._last_entry_trading_day,
+            "last_catchup_1m_ts": _dt_to_str(self.last_catchup_1m_ts),
             "initial_capital": self.initial_capital,
             "realized_pnl": self.realized_pnl,
             "strategy": self.strategy.model_dump(),
@@ -1030,6 +1153,7 @@ class PaperTradingEngine:
             self._last_stop_out_bar_ts = _dt_from_str(data.get("last_stop_out_bar_ts"))
             self._last_entry_bar_ts = _dt_from_str(data.get("last_entry_bar_ts"))
             self._last_entry_trading_day = data.get("last_entry_trading_day") or None
+            self.last_catchup_1m_ts = _dt_from_str(data.get("last_catchup_1m_ts"))
             self.initial_capital = data.get("initial_capital", self.initial_capital)
 
             strat_data = data.get("strategy")

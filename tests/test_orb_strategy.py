@@ -199,3 +199,100 @@ def test_multi_wave_allows_night_session_and_reentry_after_cooldown(monkeypatch)
     eng._last_exit_ts -= 120.0
     res2 = eng.sync_with_rule_signal("BUY_LONG", 40120.0, bars2, flatten=False, allow_multiple_entries=True, reentry_cooldown_sec=60.0)
     assert eng.position is not None and res2 is not None
+
+
+def test_orb_state_includes_vwap_and_volume_ratio():
+    # 測試 OrbState 計算 session_vwap, vol_ratio, body_ratio
+    bars = _bars(_day_path([40030, 40040]), now_tw := DAY.replace(hour=8, minute=46))
+    st = compute_orb_state(bars, now=DAY.replace(hour=9, minute=20))
+    assert st.session_vwap is not None
+    assert st.session_vwap > 39000
+    assert st.vol_ratio is not None
+    assert st.body_ratio is not None
+    assert "VWAP" in st.quality_note
+
+
+def test_breakeven_stop_moves_to_entry_plus_offset():
+    # 測試獲利達 1.0 * ATR 時，停損自動上移至 entry_price + 3.0
+    from src.schema.strategy import StrategySchema
+    from src.core.exits import compute_exit_levels
+
+    strat = StrategySchema.model_validate({
+        "id": "test_be",
+        "version": 1,
+        "symbol": "TMF",
+        "timeframe": "5m",
+        "session": "day_only",
+        "indicators": {},
+        "entry_long": {"gt": ["close", 0]},
+        "entry_short": {"lt": ["close", 0]},
+        "exit": {
+            "stop_loss": {"type": "atr_multiple", "value": 1.5, "atr_length": 14},
+            "trailing_stop": {
+                "type": "atr_multiple",
+                "value": 1.5,
+                "activation_atr_multiple": 2.0,
+                "atr_length": 14,
+                "breakeven_atr_multiple": 1.0,
+                "breakeven_offset_points": 3.0,
+            },
+        },
+    })
+    entry_p = 20000.0
+    atr_val = 50.0  # 1.0 * ATR = 50 點，1.5 * ATR = 75 點停損
+
+    # 1. 未達 1.0 倍 ATR (最高 20040，獲利 40 < 50): 停損維持初始 20000 - 75 = 19925
+    sl, tp, reason = compute_exit_levels(
+        strategy=strat, direction=1, entry_price=entry_p,
+        highest_since_entry=20040.0, lowest_since_entry=19990.0,
+        entry_atr={14: atr_val}
+    )
+    assert sl == 19925.0
+    assert reason == "stop_loss"
+
+    # 2. 獲利達 1.0 倍 ATR (最高 20055 >= 20050): 停損推進至 entry + 3.0 = 20003.0
+    sl, tp, reason = compute_exit_levels(
+        strategy=strat, direction=1, entry_price=entry_p,
+        highest_since_entry=20055.0, lowest_since_entry=19990.0,
+        entry_atr={14: atr_val}
+    )
+    assert sl == 20003.0
+    assert reason == "breakeven_stop"
+
+    # 3. 獲利進一步超過 2.0 倍 ATR (最高 20120 >= 20100): trailing_stop 啟動並超越保本價 (20120 - 75 = 20045 > 20003)
+    sl, tp, reason = compute_exit_levels(
+        strategy=strat, direction=1, entry_price=entry_p,
+        highest_since_entry=20120.0, lowest_since_entry=19990.0,
+        entry_atr={14: atr_val}
+    )
+    assert sl == 20045.0
+    assert reason == "trailing_stop"
+
+
+def test_catch_up_missed_bars_offline_replay(monkeypatch):
+    # 測試關閉網頁離線期間，重開自動補盤功能
+    eng = _engine(monkeypatch)
+    bars_1m = _bars(_day_path([40030, 40040, 40050]), start=DAY.replace(hour=8, minute=46))
+    m5 = _m5(40)
+
+    # 首次啟動：設置 last_catchup_1m_ts 為當前最新
+    msgs = eng.catch_up_missed_bars(bars_1m, m5)
+    assert msgs == []
+    assert eng.last_catchup_1m_ts == bars_1m["timestamp"][-1]
+
+    # 模擬使用者關閉網頁後過了 20 分鐘，新增突破與拉抬 K 棒
+    last_t = eng.last_catchup_1m_ts
+    missed_bars = _bars(
+        [40060, 40080, 40100, 40120],
+        start=last_t + timedelta(minutes=1)
+    )
+    full_bars = pl.concat([bars_1m, missed_bars])
+
+    # 離線回放：由於已有突破訊號且操盤啟動中，應自動補進新倉
+    eng.last_catchup_1m_ts = last_t  # 保持為離線前最後時間戳
+    msgs = eng.catch_up_missed_bars(full_bars, m5)
+    assert len(msgs) >= 1
+    assert "離線補盤" in msgs[0]
+    assert eng.position is not None
+    assert eng.last_catchup_1m_ts == full_bars["timestamp"][-1]
+

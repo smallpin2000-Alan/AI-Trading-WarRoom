@@ -88,10 +88,14 @@ def test_trailing_activation_by_atr_multiple():
     atr = {ts.atr_length: BAR_RANGE}
     entry = 40000.0
     act = ts.activation_atr_multiple * BAR_RANGE
-    # 獲利未達啟動門檻：停損仍為初始 ATR 停損
-    sl, _, reason = compute_exit_levels(strat, 1, entry, entry + act - 1, entry, atr, atr)
+    # 獲利未達保本門檻（例如 0.5 倍 ATR）：停損仍為初始 ATR 停損
+    sl, _, reason = compute_exit_levels(strat, 1, entry, entry + BAR_RANGE * 0.5, entry, atr, atr)
     assert reason == "stop_loss"
-    # 達到門檻後改為移動停損：最高價 − 1 倍 ATR
+    # 獲利達保本門檻但未達移動停損啟動門檻 (1.0 倍 ATR <= 獲利 < 2.0 倍 ATR)：停損推進為保本停損
+    sl, _, reason = compute_exit_levels(strat, 1, entry, entry + act - 1, entry, atr, atr)
+    assert reason == "breakeven_stop"
+    assert sl == entry + ts.breakeven_offset_points
+    # 達到移動停損門檻後改為移動停損：最高價 − 1 倍 ATR
     high = entry + act + 50
     sl, _, reason = compute_exit_levels(strat, 1, entry, high, entry, atr, atr)
     assert reason == "trailing_stop"

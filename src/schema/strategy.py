@@ -110,6 +110,9 @@ class TrailingStopSpec(BaseModel):
     # 以進場時 ATR 的倍數表示啟動門檻；有設定時優先於 activation_points（ATR 不可用時退回 activation_points）
     activation_atr_multiple: Optional[float] = Field(default=None, gt=0)
     atr_length: int = Field(default=14, gt=0, le=500, description="atr_multiple 使用的 ATR 期數")
+    # 保本鎖利：獲利達指定 ATR 倍數時，自動將停損移至進場價 ± offset 點（鎖定獲利/保本）
+    breakeven_atr_multiple: Optional[float] = Field(default=None, gt=0, description="順向獲利達此 ATR 倍數時啟動保本")
+    breakeven_offset_points: float = Field(default=3.0, ge=0.0, description="保本價相對進場價的保護點數（預設 3 點覆蓋成本）")
 
 
 class TimeExitSpec(BaseModel):

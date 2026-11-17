@@ -95,6 +95,56 @@ def _get_global_paper_trader_holder() -> dict:
     return {"instance": None}
 
 
+@st.cache_resource
+def _start_background_autopilot():
+    """
+    伺服器背景守護執行緒（每 30 秒執行一次）：
+    在使用者短暫關閉分頁或 Cloud Run 容器存活期間（min-instances=0 休眠前 15~30 分鐘），
+    自動在背景定期拉取報價並守護持倉停損/平倉及規則訊號進場。
+    """
+    def _worker():
+        while True:
+            try:
+                time.sleep(30)
+                holder = _get_global_paper_trader_holder()
+                pt: Optional[PaperTradingEngine] = holder.get("instance")
+                if pt is not None and (pt.is_active or pt.position is not None):
+                    # 讀取台新 API 微台最新即時報價
+                    cfg = load_taishin_default_config()
+                    u_id = cfg.get("sol_user_id", "")
+                    pwd = cfg.get("sol_password", "")
+                    if u_id and pwd:
+                        feed = TaishinQuoteFeed.get_instance(u_id, pwd)
+                        snap = feed.get_market_snapshot("TMFR1")
+                        curr_p = snap.current_price if snap and snap.current_price > 0 else 0.0
+                        if curr_p > 0:
+                            bars_1m = feed.get_kbars("TMFR1", timeframe="1m", limit=300)
+                            bars_5m = feed.get_kbars("TMFR1", timeframe="5m", limit=100)
+                            now_tw = datetime.now(_TW_TZ if "_TW_TZ" in globals() else timezone(timedelta(hours=8))).replace(tzinfo=None)
+                            orb = compute_orb_state(bars_1m, now=now_tw, params=ORB_PARAMS)
+                            # 執行離線/背景補盤
+                            pt.catch_up_missed_bars(
+                                bars_1m, bars_5m, ORB_PARAMS,
+                                allow_multiple_entries=(ORB_PARAMS.max_entries_per_session > 1)
+                            )
+                            # 執行即時規則訊號與停損守護
+                            pt.sync_with_rule_signal(
+                                action=orb.action,
+                                current_price=curr_p,
+                                df_bars=bars_5m,
+                                flatten=orb.flatten,
+                                source_note=f"{orb.session_label}背景守護",
+                                allow_multiple_entries=(ORB_PARAMS.max_entries_per_session > 1),
+                                reentry_cooldown_sec=float(ORB_PARAMS.reentry_cooldown_minutes * 60),
+                            )
+            except Exception as e:
+                logger.debug("背景自動操盤執行緒例外（忽略繼續）: %s", e)
+
+    t = threading.Thread(target=_worker, daemon=True, name="BackgroundAutopilotDaemon")
+    t.start()
+    return t
+
+
 def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
     """初始化並獲取全域紙上交易模擬引擎實例（自動從磁碟恢復狀態，跨分頁同步）"""
     holder = _get_global_paper_trader_holder()
@@ -124,6 +174,8 @@ def get_or_create_paper_trader(symbol: str) -> PaperTradingEngine:
             pt._log("SYSTEM", "出場設定已由固定點數改為 ATR 倍數停損（可信度檢核需重新執行）")
             pt.save_state_to_disk()
         holder["instance"] = pt
+        # 確保伺服器背景守護執行緒常駐啟動
+        _start_background_autopilot()
     st.session_state["paper_trader"] = pt
     return pt
 
@@ -328,7 +380,7 @@ def render_credibility_start(pt: PaperTradingEngine, bars: pl.DataFrame, unlock_
             st.rerun()
 
 
-APP_VERSION = "v2.10.0"
+APP_VERSION = "v2.11.0"
 _refreshing_advice_keys: set[str] = set()
 
 
@@ -403,7 +455,7 @@ def main():
 
     # ==================== 頂部標題區（標示軟體版本號） ====================
     st.title(f"🎯 AI 智慧看盤與多空決策戰情室 `{APP_VERSION}`")
-    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-12 規則操盤戰情版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • 開盤區間突破規則多空決策（AI 僅供參考） • 純報價零下單風險")
+    st.caption(f"🏷️ **版本號：{APP_VERSION} (2026-11-17 保本鎖利＋真突破濾網＋離線補盤版)** ｜ 🛡️ 串接台新官方 API 與期交所 0 延遲 K 線 • 開盤區間突破規則多空決策（AI 僅供參考） • 純報價零下單風險")
     history_updater = get_history_updater()
     if history_updater is not None:
         st.caption(f"📚 期交所歷史資料自動更新：{history_updater.last_result}")
@@ -881,11 +933,26 @@ def main():
                     f"<div>💹 <b>微台現價：</b>{tmf_curr_p:,.0f}"
                     f"<br/><span style='font-size:12.5px;color:#848e9c;'>距上緣 {orb.range_high - tmf_curr_p:+,.0f} ／ 距下緣 {orb.range_low - tmf_curr_p:+,.0f} 點</span></div>"
                 )
+            if orb.session_vwap is not None:
+                vwap_diff = tmf_curr_p - orb.session_vwap if tmf_curr_p > 0 else 0
+                range_html += (
+                    f"<div>⚖️ <b>當盤 VWAP：</b><span style='font-size:18px;font-weight:700;color:#38bdf8;'>{orb.session_vwap:,.0f}</span>"
+                    f"<br/><span style='font-size:12.5px;color:{'#089981' if vwap_diff >= 0 else '#f23645'};'>現價 {'偏多 (+' if vwap_diff >= 0 else '偏空 ('}{vwap_diff:,.0f}點)</span></div>"
+                )
+            if orb.vol_ratio is not None or orb.body_ratio is not None:
+                v_str = f"{orb.vol_ratio:.1f}x" if orb.vol_ratio is not None else "--"
+                b_str = f"{int(orb.body_ratio * 100)}%" if orb.body_ratio is not None else "--"
+                range_html += (
+                    f"<div>🔥 <b>量能／K棒品質：</b>"
+                    f"<br/><span style='font-size:13.5px;color:#facc15;'>量比 {v_str} ｜ 實體 {b_str}</span></div>"
+                )
         else:
             range_html = f"<div>{sess_tag}開盤區間將於開盤起 {ORB_PARAMS.range_minutes} 分鐘內形成</div>"
+        
+        note_str = f"<div style='margin-top:4px;font-size:13.5px;color:#38bdf8;'>🔍 突破品質觀測：{orb.quality_note}</div>" if orb.quality_note else ""
         breakout_html = (
-            f"<div style='margin-top:8px;font-size:15px;color:#e0e3eb;'>⚡ {orb.reason}：{orb.breakout_ts:%H:%M} 收盤 {orb.breakout_price:,.0f}</div>"
-            if orb.breakout_ts else f"<div style='margin-top:8px;font-size:15px;color:#cfd8dc;'>📝 {orb.reason}</div>"
+            f"<div style='margin-top:8px;font-size:15px;color:#e0e3eb;'>⚡ {orb.reason}：{orb.breakout_ts:%H:%M} 收盤 {orb.breakout_price:,.0f}</div>{note_str}"
+            if orb.breakout_ts else f"<div style='margin-top:8px;font-size:15px;color:#cfd8dc;'>📝 {orb.reason}</div>{note_str}"
         )
         st.markdown(
             f'<div style="background-color: {orb_bg}; border: 2px solid {orb_color}; border-radius: 12px; padding: 18px 24px; margin: 10px 0 14px 0;">'
@@ -905,6 +972,15 @@ def main():
             '</div>',
             unsafe_allow_html=True,
         )
+
+        # 🕒 關閉網頁離線重開自動補盤 (Offline Catch-Up Replay)
+        if tmf_bars_1m is not None and tmf_bars_1m.height > 0:
+            catchup_msgs = pt.catch_up_missed_bars(
+                tmf_bars_1m, feed_tmf_bars, ORB_PARAMS,
+                allow_multiple_entries=(ORB_PARAMS.max_entries_per_session > 1)
+            )
+            for c_msg in catchup_msgs:
+                st.toast(c_msg, icon="⚡")
 
         # 🛡️ 停損停利、收盤強制平倉與規則進場（停損與平倉不受暫停或風控鎖定影響；價格防護由引擎把關）
         if tmf_is_open and tmf_curr_p > 0 and (pt.position is not None or pt.is_active):

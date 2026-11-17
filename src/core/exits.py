@@ -197,6 +197,26 @@ def compute_exit_levels(
                 init_dist = ts_dist
             if init_dist is not None:
                 stop_price = (entry_price - init_dist) if direction == 1 else (entry_price + init_dist)
+
+        # -------------------------------------------------------------------
+        # 保本停損（Breakeven Stop）：獲利達 breakeven_atr_multiple * ATR 時，
+        # 將停損推進至 entry_price ∓ breakeven_offset_points 保本微利
+        # -------------------------------------------------------------------
+        be_mult = getattr(ts_spec, "breakeven_atr_multiple", None)
+        be_offset = float(getattr(ts_spec, "breakeven_offset_points", 3.0) or 0.0)
+        if be_mult is not None and be_mult > 0:
+            ln = int(getattr(ts_spec, "atr_length", 14) or 14)
+            atr_val = entry_atr.get(ln) or (current_atr.get(ln) if current_atr else None)
+            if atr_val is not None and atr_val > 0:
+                if direction == 1 and (highest_since_entry - entry_price) >= (be_mult * atr_val):
+                    be_cand = entry_price + be_offset
+                    if stop_price is None or be_cand > stop_price:
+                        stop_price, stop_reason = be_cand, "breakeven_stop"
+                elif direction == -1 and (entry_price - lowest_since_entry) >= (be_mult * atr_val):
+                    be_cand = entry_price - be_offset
+                    if stop_price is None or be_cand < stop_price:
+                        stop_price, stop_reason = be_cand, "breakeven_stop"
+
         if ts_dist is not None:
             activation = _trailing_activation(ts_spec, entry_atr)
             if direction == 1 and (highest_since_entry - entry_price) >= activation:
