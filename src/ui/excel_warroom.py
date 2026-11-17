@@ -717,20 +717,14 @@ def sync_snapshot_to_excel_app(
         xl.Visible = True
         xl.DisplayAlerts = False
 
-        # 尋找是否已打開該活頁簿
+        # 尋找使用者是否已自行打開該活頁簿；如果使用者關閉了，絕對不要擅自重新打開
         for open_wb in xl.Workbooks:
             if open_wb.FullName.lower() == abs_path.lower():
                 wb = open_wb
                 break
         if wb is None:
-            wb = xl.Workbooks.Open(abs_path)
-
-        # 確保 Excel 視窗正常顯示在前端
-        try:
-            xl.WindowState = -4143  # xlNormal
-            xl.Visible = True
-        except Exception:
-            pass
+            # 使用者已關閉活頁簿，不自動彈出干擾使用者
+            return False
 
         ws1 = wb.Worksheets("📊 戰情室即時看盤")
 
